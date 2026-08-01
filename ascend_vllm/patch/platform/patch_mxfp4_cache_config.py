@@ -13,8 +13,8 @@ def _new_init(self, *args, **kwargs):
         kwargs["cache_dtype"] = "nvfp4"
         _restore = True
     elif len(args) > 3 and args[3] == "mxfp4":
-        # cache_dtype is the 4th init field of CacheConfig:
-        # (block_size, prefix_match_unit, gpu_memory_utilization, cache_dtype)
+        # cache_dtype is the 4th init field of CacheConfig in vLLM v0.23.0:
+        # (block_size, hash_block_size, gpu_memory_utilization, cache_dtype)
         args = list(args)
         args[3] = "nvfp4"
         _restore = True
@@ -38,8 +38,11 @@ tu.is_quantized_kv_cache = _new_is_quantized_kv_cache
 _KVQM = kv_iface.KVQuantMode
 
 if not hasattr(_KVQM, "MXFP4"):
-    # Use value 6: 5 is already taken by NVFP4. MXFP4 must not alias it,
-    # otherwise IntEnum equality makes is_mxfp4 / is_nvfp4 collide.
+    # vLLM v0.23.0 KVQuantMode: NONE=0, FP8_PER_TENSOR=1,
+    # INT8_PER_TOKEN_HEAD=2, FP8_PER_TOKEN_HEAD=3, NVFP4=4. Upstream has no
+    # MXFP4 member yet. Use 6 (not 5) so MXFP4 never aliases NVFP4 or the
+    # next value upstream is most likely to add (5); IntEnum equality would
+    # otherwise make is_mxfp4 / is_nvfp4 collide.
     _mxfp4_member = int.__new__(_KVQM, 6)
     _mxfp4_member._name_ = "MXFP4"
     _mxfp4_member._value_ = 6

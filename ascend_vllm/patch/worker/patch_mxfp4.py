@@ -4,6 +4,11 @@ import torch
 import torch_npu
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+try:
+    from scipy.linalg import hadamard as _hadamard
+except ImportError:  # pragma: no cover
+    _hadamard = None
+
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
@@ -48,10 +53,13 @@ def _get_orthogonal_block(
 ) -> torch.Tensor: 
     key = ("block", device, dtype)
     if key not in _ROTATION_MATRICES:
-        from scipy.linalg import hadamard
-
+        if _hadamard is None:
+            raise ImportError(
+                "mxfp4 KV cache requires scipy for the Hadamard rotation "
+                "matrix (pip install scipy)"
+            )
         _ROTATION_MATRICES[key] = (
-            torch.tensor(hadamard(MXFP4_SCALE_GROUP_SIZE, dtype=float), dtype=dtype, device=device)
+            torch.tensor(_hadamard(MXFP4_SCALE_GROUP_SIZE, dtype=float), dtype=dtype, device=device)
             / math.sqrt(MXFP4_SCALE_GROUP_SIZE)
         )
 
@@ -77,6 +85,10 @@ def _mxfp4_attn_init(
     self.enable_mxfp4_kv_cache = self.kv_cache_dtype == "mxfp4"
     self.mxfp4_k_scale_cache = None
     self.mxfp4_v_scale_cache = None
+    # Per-layer, per-graph-size rotation buffers. Keyed by num_tokens because
+    # one layer is captured at multiple graph sizes; stored on the instance
+    # (not a global pool) so layers never share a buffer.
+    self.mxfp4_query_rot_buffers: dict[int, torch.Tensor] = {}
 
 AscendAttentionBackendImpl.__init__ = _mxfp4_attn_init
 
@@ -194,6 +206,10 @@ def _mxfp4_forward(
     output=None, output_scale=None, output_block_scale=None
 ):
     if getattr(self, "enable_mxfp4_kv_cache", False):
+        # Record the layer name so graph replay can match metadata by name
+        # instead of relying on attn_metadata iteration order (mirrors
+        # upstream layer-aware replay for mixed-attention models).
+        self._layer_name = layer.layer_name
         return self._forward_mxfp4(
             layer, query, key, value, kv_cache, attn_metadata, output
         )
@@ -209,6 +225,20 @@ AscendAttentionBackendImpl.forward = _mxfp4_forward
 def _forward_mxfp4(
     self, layer, query, key, value, kv_cache, attn_metadata, output,
 ) -> torch.Tensor:
+    # Mirror upstream forward's cache bootstrap: when key/value are None
+    # (e.g. pooling / encoder-only paths) the cache may never be bound via
+    # _scatter_mxfp4_kv_and_scales, so bind it here to keep later
+    # self.key_cache.shape accesses safe.
+    if self.key_cache is None and kv_cache is not None:
+        if (
+            isinstance(kv_cache, torch.Tensor)
+            and kv_cache.dim() > 0
+            and kv_cache.shape[0] == 2
+            or isinstance(kv_cache, (list, tuple))
+            and len(kv_cache) >= 2
+        ):
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+
     float_key, float_value = None, None
     if key is not None and value is not None:
         if attn_metadata.attn_state not in (
@@ -290,14 +320,13 @@ def full_graph_mxfp4_decode(
     workspace = graph_params.workspaces.get(num_tokens)
     softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
 
-    _pool_key = (num_tokens, _EXTRA_CTX.is_draft_model)
-
-    if _pool_key not in _POOL_BUFS:
-        _POOL_BUFS[_pool_key] = {
-            "query_rot": torch.zeros_like(query[:num_tokens])
-        }
-    _pool_bufs = _POOL_BUFS[_pool_key]
-    _query_rot = _pool_bufs["query_rot"]
+    # One rotation buffer per (num_tokens) per layer instance: a layer is
+    # captured at multiple graph sizes, and different layers must never share
+    # a buffer (they would overwrite each other on replay).
+    _query_rot = self.mxfp4_query_rot_buffers.get(num_tokens)
+    if _query_rot is None:
+        _query_rot = torch.zeros_like(query[:num_tokens])
+        self.mxfp4_query_rot_buffers[num_tokens] = _query_rot
 
     k_scale = self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
     v_scale = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
@@ -354,7 +383,15 @@ def full_graph_mxfp4_decode(
             self.mxfp4_v_scale_cache,
             None,
             weak_ref_tensors(_query_rot),
-            weak_ref_tensors(query)
+            # Weak ref to the live query tensor: update_graph_params later
+            # re-dereferences it to rotate the current step's query into the
+            # fixed-address _query_rot buffer. This relies on vLLM's graph
+            # capture semantics where intermediate tensors (query) are stable
+            # buffers whose contents are overwritten each step, NOT recreated
+            # per forward. If upstream ever switches to per-step allocation,
+            # this weak ref may resolve to None and rotation would be skipped.
+            weak_ref_tensors(query),
+            self._graph_metadata_layer_name(),
         )
     )
 
@@ -384,8 +421,6 @@ def full_graph_mxfp4_decode(
     handle = torch.npu.graph_task_group_end(stream)
     graph_params.handles[num_tokens].append(handle)
     return output, num_tokens
-
-_POOL_BUFS: dict = {}
 
 AscendAttentionBackendImpl.full_graph_mxfp4_decode = full_graph_mxfp4_decode
 
@@ -721,21 +756,14 @@ def _mxfp4_update_graph_params(
             graph_params = get_graph_params()
             attn_metadata = forward_context.attn_metadata
             attn_keys = list(attn_metadata.keys())
-            global _ATTN_KEYS_BUFFER
             attn_keys_length = len(graph_params.attn_params[num_tokens])
             if attn_keys_length == 0:
                 return
-            if _ATTN_KEYS_BUFFER is None or len(_ATTN_KEYS_BUFFER) != attn_keys_length:
-                import regex as re
-
-                def extract_layer_index(key: str) -> int:
-                    match = re.search(r"(\d+)", key)
-                    return int(match.group(1)) if match else 0
-
-                attn_keys_tmp = attn_keys[:attn_keys_length]
-                attn_keys_tmp.sort(key=extract_layer_index)
-                _ATTN_KEYS_BUFFER = attn_keys_tmp
-            attn_keys[:attn_keys_length] = _ATTN_KEYS_BUFFER
+            # No sorting: each captured param carries its own layer name and
+            # replay looks the metadata up by name (see metadata_key below),
+            # so iteration order is irrelevant. This mirrors upstream
+            # layer-aware replay (gemma4) and is robust to mixed-attention
+            # models where metadata order != layer order.
 
         num_layers = len(attn_keys)
         if num_layers == 0:
@@ -772,7 +800,8 @@ def _mxfp4_update_graph_params(
                 c8_v_aq_scale,
                 c8_v_aq_offset,
                 mxfp4_query_rot,
-                mxfp4_orig_query
+                mxfp4_orig_query,
+                layer_name
                 ) = param
                 if _EXTRA_CTX.is_draft_model:
                     draft_step, key = draft_attn_key_steps[attn_count]
@@ -784,10 +813,19 @@ def _mxfp4_update_graph_params(
                     if not meta.causal:
                         sparse_mode = 0
                 else:
-                    seq_lens = attn_metadata[key].seq_lens_list
-                    actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
-                    if not hasattr(vllm_config.model_config.hf_text_config, "sliding_window"):
-                        block_tables = attn_metadata[key].block_tables
+                    # Resolve metadata by the captured layer name (falls back
+                    # to the zip key when the name is absent, mirroring
+                    # upstream layer-aware replay).
+                    metadata_key = (
+                        layer_name
+                        if layer_name is not None and layer_name in attn_metadata
+                        else key
+                    )
+                    seq_lens = attn_metadata[metadata_key].seq_lens_list
+                    actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
+                    # mxfp4 targets (Qwen3.5 / GLM5.2) have no sliding window,
+                    # so block_tables always comes from live metadata.
+                    block_tables = attn_metadata[metadata_key].block_tables
                 
                 if mxfp4_orig_query is not None and mxfp4_query_rot is not None:
                     _q_in = mxfp4_orig_query[:num_tokens]
@@ -826,8 +864,6 @@ def _mxfp4_update_graph_params(
                 torch.npu.graph_task_update_end(update_stream)
 
                 event.record(update_stream)
-
-_ATTN_KEYS_BUFFER = None
 
 _orig_update_graph_params = AscendAttentionBackendImpl.update_graph_params
 
@@ -958,10 +994,12 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
                 continue
 
             raw_k_tensor, raw_v_tensor = raw
-            k_cache, v_cache = kv_caches[layer_name][:2]
 
-            actual_num_blocks = k_cache.shape[0]
-            actual_block_size = k_cache.shape[1]
+            # Only the block layout is needed from the original reshape; the
+            # raw tensors below are re-carved into data + scale views.
+            orig_k_cache = kv_caches[layer_name][0]
+            actual_num_blocks = orig_k_cache.shape[0]
+            actual_block_size = orig_k_cache.shape[1]
             hs_k = current_kv_cache_spec.head_size
             hs_v = getattr(current_kv_cache_spec, "head_size_v", hs_k) or hs_k
             nk = current_kv_cache_spec.num_kv_heads
