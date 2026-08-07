@@ -78,39 +78,59 @@ def register_kv_failure_patch():
 def register_general_plugin_patch():
     """Load ModelArts runtime patches through vLLM general plugins."""
     register_kv_failure_patch()
+    # Explicitly load worker patches too (patch_mxfp4 etc.); this runs in
+    # every process where general plugins load (engine core, API server,
+    # worker processes), complementing the meta-path hook for processes
+    # where general plugins are filtered out by VLLM_PLUGINS.
+    from ascend_vllm.patch import worker  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
-# Meta-path import hook for reliable patch loading.
+# Meta-path import hooks for reliable patch loading.
 #
-# Following the ascend-vllm (v6.5.306) pattern: the hook is installed at
-# ``ascend_vllm`` import time (when vllm loads the platform plugin) and
-# intercepts the import of ``vllm_ascend.ops``, which is imported naturally
-# during vllm startup after vllm_ascend's own patches are applied.  Once that
-# module is loaded, the hook triggers ``import ascend_vllm.patch.platform`` so
-# all platform patches (including cloud_ops_turbo) are applied — regardless of
-# whether ``pre_register_and_update`` is called or ``VLLM_PLUGINS`` filters
+# Following the ascend-vllm (v6.5.306) pattern: hooks are installed at
+# ``ascend_vllm`` import time (when vllm resolves the platform plugin, which
+# happens in every process) and intercept imports that occur naturally during
+# vllm startup, then trigger the matching ModelArts patch package:
+#
+# * ``vllm_ascend.ops``          → ``ascend_vllm.patch.platform``
+# * ``vllm_ascend.patch.worker`` → ``ascend_vllm.patch.worker``
+#
+# The worker process imports ``vllm_ascend.ops`` in ``NPUWorker.__init__`` and
+# imports ``vllm_ascend.patch.worker`` via ``adapt_patch()`` right before the
+# worker class is instantiated — the ideal trigger for the MXFP4 worker patch,
+# which must be loaded before any attention backend is created. Hooking these
+# imports keeps patch loading reliable regardless of whether
+# ``pre_register_and_update`` is called or ``VLLM_PLUGINS`` filters
 # general_plugins entry points.
 # ---------------------------------------------------------------------------
 
 
-class _OpsPatchLoader(importlib.abc.Loader):
-    def __init__(self, original):
+class _PatchImportLoader(importlib.abc.Loader):
+    """Wrap the original loader; run ``on_loaded`` once after exec_module."""
+
+    def __init__(self, original, on_loaded):
         self._original = original
+        self._on_loaded = on_loaded
+        self._done = False
 
     def create_module(self, spec):
         return self._original.create_module(spec)
 
     def exec_module(self, module):
         self._original.exec_module(module)
-        if not _OpsPatchHook._done:
-            _OpsPatchHook._done = True
-            import ascend_vllm.patch.platform  # noqa: F401
+        if not self._done:
+            self._done = True
+            self._on_loaded()
 
 
-class _OpsPatchHook(importlib.abc.MetaPathFinder):
-    _target = "vllm_ascend.ops"
-    _done = False
+class _PatchImportHook(importlib.abc.MetaPathFinder):
+    """Intercept the import of one ``target`` and run ``on_loaded`` once."""
+
+    def __init__(self, target, on_loaded):
+        self._target = target
+        self._on_loaded = on_loaded
+        self._done = False
 
     def find_spec(self, name, path, target=None):
         if name == self._target and not self._done:
@@ -119,13 +139,30 @@ class _OpsPatchHook(importlib.abc.MetaPathFinder):
                     continue
                 spec = f.find_spec(name, path, target)
                 if spec is not None:
-                    spec.loader = _OpsPatchLoader(spec.loader)
+                    spec.loader = _PatchImportLoader(spec.loader, self._on_loaded)
                     return spec
         return None
 
 
-if not any(isinstance(f, _OpsPatchHook) for f in sys.meta_path):
-    sys.meta_path.insert(0, _OpsPatchHook())
-if _OpsPatchHook._target in sys.modules and not _OpsPatchHook._done:
-    _OpsPatchHook._done = True
+def _install_patch_import_hook(target, on_loaded):
+    if not any(
+        isinstance(f, _PatchImportHook) and f._target == target
+        for f in sys.meta_path
+    ):
+        sys.meta_path.insert(0, _PatchImportHook(target, on_loaded))
+    if target in sys.modules:
+        # Target already finished importing (we were imported late): apply
+        # the patch set right away instead of waiting for a new import.
+        on_loaded()
+
+
+def _load_platform_patches():
     import ascend_vllm.patch.platform  # noqa: F401
+
+
+def _load_worker_patches():
+    import ascend_vllm.patch.worker  # noqa: F401
+
+
+_install_patch_import_hook("vllm_ascend.ops", _load_platform_patches)
+_install_patch_import_hook("vllm_ascend.patch.worker", _load_worker_patches)

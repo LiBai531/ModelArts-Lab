@@ -10,28 +10,24 @@ try:
 except ImportError:  # pragma: no cover
     _hadamard = None
 
-from ascend_vllm.patch.platform.patch_mxfp4_cache_config import (
-    AscendFullAttentionC4Spec,
-    mxfp4_kv_cache_data_dim,
-    mxfp4_kv_cache_scale_dim,
-)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.attention_v1 import (
-    AscendAttentionBackendImpl,
-    AscendAttentionState,
-    AscendMetadata
-)
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
 from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     get_draft_graph_prefill_params,
     get_graph_params,
     update_draft_graph_params_workspaces,
-    update_graph_params_workspaces
+    update_graph_params_workspaces,
 )
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
+from ascend_vllm.patch.platform.patch_mxfp4_cache_config import (
+    AscendFullAttentionC4Spec,
+    mxfp4_kv_cache_data_dim,
+    mxfp4_kv_cache_scale_dim,
+)
 
 FLOAT4_E2M1FN_X2_DTYPE = getattr(
     torch_npu, "float4_e2m1fn_x2", getattr(torch, "float4_e2m1fn_x2", None)
@@ -63,6 +59,7 @@ def _is_mxfp4_kv_enabled() -> bool:
     try:
         enabled = getattr(get_ascend_config(), "enable_mxfp4_kv", False)
     except RuntimeError:
+        logger.info_once("[mxfp4_kv] ascend_config not initialized yet, mxfp4 disabled for now")
         return False
     logger.info_once("[mxfp4_kv] enable_mxfp4_kv = %s", enabled)
     return enabled
@@ -189,7 +186,7 @@ def _scatter_mxfp4_kv_and_scales(
     k_scales, v_scales,
     kv_cache, attn_metadata
 ):
-    if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) < 2:
+    if not isinstance(kv_cache, list | tuple) or len(kv_cache) < 2:
         return
     
     if kv_cache[0] is not self.key_cache:
@@ -257,7 +254,7 @@ def _forward_mxfp4(
             isinstance(kv_cache, torch.Tensor)
             and kv_cache.dim() > 0
             and kv_cache.shape[0] == 2
-            or isinstance(kv_cache, (list, tuple))
+            or isinstance(kv_cache, list | tuple)
             and len(kv_cache) >= 2
         ):
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
@@ -452,7 +449,6 @@ def _forward_mxfp4_decode(self, query, attn_metadata, output) -> torch.Tensor:
     num_block, block_size, _, _ = self.key_cache.shape
     key_3d = self.key_cache.view(num_block, block_size, -1)
     value_3d = self.value_cache.view(num_block, block_size, -1)
-    num_tokens = query.shape[0]
 
     if attn_metadata.attn_state == AscendAttentionState.SpecDecoding:
         num_decodes = attn_metadata.num_decodes
@@ -1002,8 +998,6 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
         return _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors)
 
     kv_caches = _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors)
-
-    layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
 
     for group in self._kv_cache_spec_attn_group_iterator():
         current_kv_cache_spec = group.kv_cache_spec 
