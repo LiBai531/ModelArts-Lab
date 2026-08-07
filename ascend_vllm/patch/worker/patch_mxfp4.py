@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch_npu
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 try:
@@ -60,9 +61,11 @@ def _is_mxfp4_kv_enabled() -> bool:
     case treat MXFP4 as disabled rather than crashing.
     """
     try:
-        return getattr(get_ascend_config(), "enable_mxfp4_kv", False)
+        enabled = getattr(get_ascend_config(), "enable_mxfp4_kv", False)
     except RuntimeError:
         return False
+    logger.info_once("[mxfp4_kv] enable_mxfp4_kv = %s", enabled)
+    return enabled
 
 
 _ROTATION_MATRICES: dict[tuple, torch.Tensor] = {}
@@ -1062,6 +1065,7 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
     kv_cache_spec = _orig_get_kv_cache_spec(self)
     if not _is_mxfp4_kv_enabled():
         return kv_cache_spec
+    replaced = 0
     for layer_name, spec in kv_cache_spec.items():
         if isinstance(spec, FullAttentionSpec) and not isinstance(
             spec, AscendFullAttentionC4Spec
@@ -1083,6 +1087,11 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
                 page_size_padded=spec.page_size_padded,
                 indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride,
             )
+            replaced += 1
+    logger.info(
+        "[mxfp4_kv] replaced %d dense attention spec(s) with AscendFullAttentionC4Spec",
+        replaced,
+    )
     return kv_cache_spec
 
 
