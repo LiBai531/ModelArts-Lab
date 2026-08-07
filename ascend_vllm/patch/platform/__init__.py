@@ -13,8 +13,9 @@ Add new platform patches here by importing the patch module:
 # VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO via vllm_ascend.envs.
 from ascend_vllm.patch.platform import patch_envs as patch_envs  # noqa: F401
 
-# mxfp4 cache config patch must load before worker init so
-# cache_dtype="mxfp4" passes Pydantic validation at config parse time.
+# Defines AscendFullAttentionC4Spec (MXFP4 KV-cache spec: data + per-32-group
+# scale in one page). Must load before worker init so the worker patch can
+# import it for spec creation. Enabled via additional-config enable_mxfp4_kv.
 from ascend_vllm.patch.platform import patch_mxfp4_cache_config as patch_mxfp4_cache_config
 
 # patch_chunk_fla computes chunk_offsets_idx on-the-fly from cu_seqlens

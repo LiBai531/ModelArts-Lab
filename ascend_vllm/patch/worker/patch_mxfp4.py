@@ -2,13 +2,19 @@ import math
 
 import torch
 import torch_npu
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 try:
     from scipy.linalg import hadamard as _hadamard
 except ImportError:  # pragma: no cover
     _hadamard = None
 
+from ascend_vllm.patch.platform.patch_mxfp4_cache_config import (
+    AscendFullAttentionC4Spec,
+    mxfp4_kv_cache_data_dim,
+    mxfp4_kv_cache_scale_dim,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
@@ -43,6 +49,15 @@ def _mxfp4_fia_v2_dequant_kwargs():
         "dequant_scale_key_dtype": torch.float8_e8m0fnu,
         "dequant_scale_value_dtype": torch.float8_e8m0fnu,
     }
+
+
+def _is_mxfp4_kv_enabled() -> bool:
+    """Whether MXFP4 KV cache is enabled via additional-config.
+
+    Same switch as the GLM-5.2 SFA path (ascend_config.enable_mxfp4_kv), so
+    dense MXFP4 shares the config surface instead of a kv_cache_dtype hack.
+    """
+    return getattr(get_ascend_config(), "enable_mxfp4_kv", False)
 
 
 _ROTATION_MATRICES: dict[tuple, torch.Tensor] = {}
@@ -82,7 +97,7 @@ def _mxfp4_attn_init(
         sliding_window, kv_cache_dtype, logits_soft_cap, attn_type,
         kv_sharing_target_layer_name, sinks=sinks, **kwargs,
     )
-    self.enable_mxfp4_kv_cache = self.kv_cache_dtype == "mxfp4"
+    self.enable_mxfp4_kv_cache = _is_mxfp4_kv_enabled()
     self.mxfp4_k_scale_cache = None
     self.mxfp4_v_scale_cache = None
     # Per-layer, per-graph-size rotation buffers. Keyed by num_tokens because
@@ -717,7 +732,7 @@ def _mxfp4_update_graph_params(
     num_dcp_pcp_tokens=None,
     draft_attn_metadatas=None
 ):
-    is_mxfp4 = vllm_config.cache_config.cache_dtype == "mxfp4"
+    is_mxfp4 = _is_mxfp4_kv_enabled()
 
     if not is_mxfp4:
         # Non-mxfp4 models: defer to the original implementation so this patch
@@ -975,7 +990,7 @@ _orig_reshape = NPUModelRunner._reshape_kv_cache_tensors
 
 
 def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors):
-    if self.vllm_config.cache_config.cache_dtype != "mxfp4":
+    if not _is_mxfp4_kv_enabled():
         return _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors)
 
     kv_caches = _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors)
@@ -987,7 +1002,10 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
         for layer_name in group.layer_names:
             if layer_name in self.runner_only_attn_layers:
                 continue
-            if not isinstance(current_kv_cache_spec, AttentionSpec):
+            # Only C4 (MXFP4) layers are re-carved here; any other attention
+            # spec (e.g. SlidingWindow in a mixed model) keeps the original
+            # reshape result.
+            if not isinstance(current_kv_cache_spec, AscendFullAttentionC4Spec):
                 continue
             raw = kv_cache_raw_tensors.get(layer_name)
             if not isinstance(raw, tuple) or len(raw) != 2:
@@ -1000,28 +1018,31 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
             orig_k_cache = kv_caches[layer_name][0]
             actual_num_blocks = orig_k_cache.shape[0]
             actual_block_size = orig_k_cache.shape[1]
+            # With AscendFullAttentionC4Spec, head_size / head_size_v are the
+            # packed float4 data dims (head//2) and scale_dim / scale_dim_v are
+            # the per-32-group e8m0 scales (head//32). Each raw tensor holds the
+            # data region first, then the scale region, as separate views
+            # managed by the same block table.
             hs_k = current_kv_cache_spec.head_size
             hs_v = getattr(current_kv_cache_spec, "head_size_v", hs_k) or hs_k
+            sk = getattr(current_kv_cache_spec, "scale_dim", 0)
+            sv = getattr(current_kv_cache_spec, "scale_dim_v", sk) or sk
             nk = current_kv_cache_spec.num_kv_heads
 
-            # Each raw tensor holds data+scale (data region first, then scale),
-            # carved into contiguous data and scale views. No separate scale
-            # allocation, no waste: real_page_size_bytes already budgets
-            # data+scale and _orig_allocate sizes k/v to data+scale.
-            k_data_numel = actual_num_blocks * actual_block_size * nk * (hs_k // 2)
-            k_scale_numel = actual_num_blocks * actual_block_size * nk * (hs_k // 32)
-            v_data_numel = actual_num_blocks * actual_block_size * nk * (hs_v // 2)
-            v_scale_numel = actual_num_blocks * actual_block_size * nk * (hs_v // 32)
+            k_data_numel = actual_num_blocks * actual_block_size * nk * hs_k
+            k_scale_numel = actual_num_blocks * actual_block_size * nk * sk
+            v_data_numel = actual_num_blocks * actual_block_size * nk * hs_v
+            v_scale_numel = actual_num_blocks * actual_block_size * nk * sv
             raw_k = raw_k_tensor.view(torch.uint8)
             raw_v = raw_v_tensor.view(torch.uint8)
             k_cache = raw_k[:k_data_numel].view(
-                actual_num_blocks, actual_block_size, nk, hs_k // 2)
+                actual_num_blocks, actual_block_size, nk, hs_k)
             k_scale_cache = raw_k[k_data_numel:k_data_numel + k_scale_numel].view(
-                actual_num_blocks, actual_block_size, nk, hs_k // 32)
+                actual_num_blocks, actual_block_size, nk, sk)
             v_cache = raw_v[:v_data_numel].view(
-                actual_num_blocks, actual_block_size, nk, hs_v // 2)
+                actual_num_blocks, actual_block_size, nk, hs_v)
             v_scale_cache = raw_v[v_data_numel:v_data_numel + v_scale_numel].view(
-                actual_num_blocks, actual_block_size, nk, hs_v // 32)
+                actual_num_blocks, actual_block_size, nk, sv)
 
             kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
         
@@ -1029,12 +1050,45 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
 
 NPUModelRunner._reshape_kv_cache_tensors = _mxfp4_reshape_kv_cache_tensors
 
+_orig_get_kv_cache_spec = NPUModelRunner.get_kv_cache_spec
+
+
+def _mxfp4_get_kv_cache_spec(self) -> dict:
+    kv_cache_spec = _orig_get_kv_cache_spec(self)
+    if not _is_mxfp4_kv_enabled():
+        return kv_cache_spec
+    for layer_name, spec in kv_cache_spec.items():
+        if isinstance(spec, FullAttentionSpec) and not isinstance(
+            spec, AscendFullAttentionC4Spec
+        ):
+            # MXFP4: head_size / head_size_v are the packed float4 data dims
+            # (head//2); scale_dim / scale_dim_v are the per-32-group e8m0
+            # scales (head//32). Data and scale are separate regions of one
+            # page, managed by the same block table, so vLLM allocates the
+            # exact MXFP4 layout from the custom spec - no kv_cache_dtype.
+            kv_cache_spec[layer_name] = AscendFullAttentionC4Spec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=mxfp4_kv_cache_data_dim(spec.head_size),
+                head_size_v=mxfp4_kv_cache_data_dim(spec.head_size_v),
+                dtype=torch.uint8,
+                kv_quant_mode=KVQuantMode.NONE,
+                scale_dim=mxfp4_kv_cache_scale_dim(spec.head_size),
+                scale_dim_v=mxfp4_kv_cache_scale_dim(spec.head_size_v),
+                page_size_padded=spec.page_size_padded,
+                indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride,
+            )
+    return kv_cache_spec
+
+
+NPUModelRunner.get_kv_cache_spec = _mxfp4_get_kv_cache_spec
+
 _orig_dummy_run = NPUModelRunner._dummy_run
 
 
 def _mxfp4_dummy_run(self, *args, **kwargs):
     is_graph_capturing = kwargs.get("is_graph_capturing", False)
-    if is_graph_capturing and self.vllm_config.cache_config.cache_dtype == "mxfp4":
+    if is_graph_capturing and _is_mxfp4_kv_enabled():
         self._precompute_mxfp4_workspaces()
     return _orig_dummy_run(self, *args, **kwargs)
 

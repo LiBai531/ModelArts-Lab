@@ -1,150 +1,65 @@
+"""MXFP4 KV cache: custom spec that drives KV-cache allocation, no kv_cache_dtype hack.
+
+Enabled via additional-config ``enable_mxfp4_kv: true``. The KV cache page is
+allocated from the spec's ``real_page_size_bytes`` = packed float4 data
+(head//2) + per-32-group e8m0 scale (head//32), kept as separate regions of
+one page and managed by the same block table. This mirrors the GLM-5.2 SFA
+``AscendMLAAttentionSpec`` approach (spec drives allocation directly), so
+``kv_cache_dtype`` stays at the vLLM default and none of the previous
+monkey-patches (CacheConfig swap, KVQuantMode injection, get_kv_quant_mode,
+real_page_size_bytes) are needed.
+"""
+
+from dataclasses import dataclass
+
 import torch
 
-from vllm.config import cache as cache_mod
-from vllm.utils import torch_utils as tu
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1 import kv_cache_interface as kv_iface
-
-_orig_init = cache_mod.CacheConfig.__init__
-
-
-def _new_init(self, *args, **kwargs):
-    _restore = False
-    if kwargs.get("cache_dtype") == "mxfp4":
-        kwargs["cache_dtype"] = "nvfp4"
-        _restore = True
-    elif len(args) > 3 and args[3] == "mxfp4":
-        # cache_dtype is the 4th init field of CacheConfig in vLLM v0.23.0:
-        # (block_size, hash_block_size, gpu_memory_utilization, cache_dtype)
-        args = list(args)
-        args[3] = "nvfp4"
-        _restore = True
-    _orig_init(self, *args, **kwargs)
-    if _restore:
-        object.__setattr__(self, "cache_dtype", "mxfp4")
-
-
-cache_mod.CacheConfig.__init__ = _new_init
-
-tu.STR_DTYPE_TO_TORCH_DTYPE["mxfp4"] = torch.uint8
-
-_orig_is_quant = tu.is_quantized_kv_cache
-
-
-def _new_is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return _orig_is_quant(kv_cache_dtype) or kv_cache_dtype == "mxfp4"
-
-tu.is_quantized_kv_cache = _new_is_quantized_kv_cache
-
-_KVQM = kv_iface.KVQuantMode
-
-if not hasattr(_KVQM, "MXFP4"):
-    # vLLM v0.23.0 KVQuantMode: NONE=0, FP8_PER_TENSOR=1,
-    # INT8_PER_TOKEN_HEAD=2, FP8_PER_TOKEN_HEAD=3, NVFP4=4. Upstream has no
-    # MXFP4 member yet. Use 6 (not 5) so MXFP4 never aliases NVFP4 or the
-    # next value upstream is most likely to add (5); IntEnum equality would
-    # otherwise make is_mxfp4 / is_nvfp4 collide.
-    _mxfp4_member = int.__new__(_KVQM, 6)
-    _mxfp4_member._name_ = "MXFP4"
-    _mxfp4_member._value_ = 6
-    _KVQM._member_map_["MXFP4"] = _mxfp4_member
-    _KVQM._value2member_map_[6] = _mxfp4_member
-
-_KVQM.is_mxfp4 = property(lambda self: self == _KVQM.MXFP4)
 
 
 def mxfp4_kv_cache_data_dim(head_size: int) -> int:
+    """Packed float4 data bytes per head (2 fp4 values per byte)."""
     return head_size // 2
 
 
 def mxfp4_kv_cache_scale_dim(head_size: int) -> int:
+    """Per-32-element-group e8m0 scale count per head."""
     return head_size // 32
 
 
-_orig_get_kv_quant_mode = kv_iface.get_kv_quant_mode
+@dataclass(frozen=True, kw_only=True)
+class AscendFullAttentionC4Spec(kv_iface.FullAttentionSpec):
+    """Full attention spec for C4 (MXFP4) KV cache.
 
+    ``head_size`` / ``head_size_v`` are the packed float4 data dims
+    (head//2); ``scale_dim`` / ``scale_dim_v`` are the per-32-group e8m0
+    scale dims (head//32). The page is data + scale (separate regions, one
+    block table), so ``real_page_size_bytes`` returns the exact MXFP4 layout
+    and vLLM allocates the correct size without touching kv_cache_dtype.
 
-def _new_get_kv_quant_mode(kv_cache_dtype: str):
-    if kv_cache_dtype == "mxfp4":
-        return _KVQM.MXFP4
-    return _orig_get_kv_quant_mode(kv_cache_dtype)
+    Inherits FullAttentionSpec, so the default FullAttentionManager handles
+    it (KVCacheSpecRegistry walks the MRO).
+    """
 
-kv_iface.get_kv_quant_mode = _new_get_kv_quant_mode
+    scale_dim: int = 0
+    scale_dim_v: int = 0
+    scale_dtype: torch.dtype = torch.uint8
 
-for _mod_name in (
-    "vllm.model_executor.layers.attention.attention",
-    "vllm.model_executor.layers.attention"
-):
-    try:
-        import importlib
-        _m = importlib.import_module(_mod_name)
-        if hasattr(_m, "get_kv_quant_mode"):
-            _m.get_kv_quant_mode = _new_get_kv_quant_mode
-    except ImportError:
-        pass
+    def __post_init__(self):
+        super().__post_init__()
+        if self.scale_dim_v == 0:
+            object.__setattr__(self, "scale_dim_v", self.scale_dim)
 
-_get_dtype_size = tu.get_dtype_size
-
-_AS = kv_iface.AttentionSpec
-_orig_as_rpsb = _AS.real_page_size_bytes.fget
-
-
-def _mxfp4_as_rpsb(self):
-    if self.kv_quant_mode == _KVQM.MXFP4:
-        data_dim = mxfp4_kv_cache_data_dim(self.head_size)
-        scale_dim = mxfp4_kv_cache_scale_dim(self.head_size)
-        return (
-            2
-            * self.block_size
-            * self.num_kv_heads
-            * (data_dim + scale_dim)
-            * _get_dtype_size(self.dtype)
-        )
-    return _orig_as_rpsb(self)
-
-_AS.real_page_size_bytes = property(_mxfp4_as_rpsb)
-
-_FAS = kv_iface.FullAttentionSpec
-_orig_fas_rpsb = _FAS.real_page_size_bytes.fget
-
-
-def _mxfp4_fas_rpsb(self):
-    if self.kv_quant_mode == _KVQM.MXFP4:
-        last_dim = (
-            mxfp4_kv_cache_data_dim(self.head_size)
-            + mxfp4_kv_cache_data_dim(self.head_size_v)
-            + mxfp4_kv_cache_scale_dim(self.head_size)
-            + mxfp4_kv_cache_scale_dim(self.head_size_v)
-        )
-
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * last_dim
-            * _get_dtype_size(self.dtype)
-        )
-    return _orig_fas_rpsb(self)
-
-_FAS.real_page_size_bytes = property(_mxfp4_fas_rpsb)
-
-_SWS = kv_iface.SlidingWindowSpec
-_orig_sws_rpsb = _SWS.real_page_size_bytes.fget
-
-
-def _mxfp4_sws_rpsb(self):
-    if self.kv_quant_mode == _KVQM.MXFP4:
-        last_dim = (
-            mxfp4_kv_cache_data_dim(self.head_size)
-            + mxfp4_kv_cache_data_dim(self.head_size_v)
-            + mxfp4_kv_cache_scale_dim(self.head_size)
-            + mxfp4_kv_cache_scale_dim(self.head_size_v)
-        )
-
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * last_dim
-            * _get_dtype_size(self.dtype)
-        )
-    return _orig_sws_rpsb(self)
-
-_SWS.real_page_size_bytes = property(_mxfp4_sws_rpsb)
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.scale_dim == 0:
+            # Not an MXFP4 layout: fall back to the plain full-attention page.
+            return super().real_page_size_bytes
+        data_bytes = (
+            self.head_size + self.head_size_v
+        ) * get_dtype_size(self.dtype)
+        scale_bytes = (
+            self.scale_dim + self.scale_dim_v
+        ) * get_dtype_size(self.scale_dtype)
+        return self.block_size * self.num_kv_heads * (data_bytes + scale_bytes)
