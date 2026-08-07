@@ -56,8 +56,13 @@ def _is_mxfp4_kv_enabled() -> bool:
 
     Same switch as the GLM-5.2 SFA path (ascend_config.enable_mxfp4_kv), so
     dense MXFP4 shares the config surface instead of a kv_cache_dtype hack.
+    Ascend config may not be initialized yet when the patch loads, in which
+    case treat MXFP4 as disabled rather than crashing.
     """
-    return getattr(get_ascend_config(), "enable_mxfp4_kv", False)
+    try:
+        return getattr(get_ascend_config(), "enable_mxfp4_kv", False)
+    except RuntimeError:
+        return False
 
 
 _ROTATION_MATRICES: dict[tuple, torch.Tensor] = {}
