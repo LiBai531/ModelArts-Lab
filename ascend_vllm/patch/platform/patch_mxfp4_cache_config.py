@@ -63,3 +63,17 @@ class AscendFullAttentionC4Spec(kv_iface.FullAttentionSpec):
             self.scale_dim + self.scale_dim_v
         ) * get_dtype_size(self.scale_dtype)
         return self.block_size * self.num_kv_heads * (data_bytes + scale_bytes)
+
+    @classmethod
+    def merge(cls, specs):
+        """Override to preserve C4-specific fields.
+
+        FullAttentionSpec.merge() constructs the merged spec without passing
+        scale_dim / scale_dim_v / scale_dtype, so they default to 0 and the
+        MXFP4 layout is silently lost. Restore them from the first spec.
+        """
+        merged = super().merge(specs)
+        object.__setattr__(merged, "scale_dim", specs[0].scale_dim)
+        object.__setattr__(merged, "scale_dim_v", specs[0].scale_dim_v)
+        object.__setattr__(merged, "scale_dtype", specs[0].scale_dtype)
+        return merged
