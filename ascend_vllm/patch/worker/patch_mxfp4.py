@@ -49,20 +49,17 @@ def _mxfp4_fia_v2_dequant_kwargs():
 
 
 def _is_mxfp4_kv_enabled() -> bool:
-    """Whether MXFP4 KV cache is enabled via additional-config.
-
-    Same switch as the GLM-5.2 SFA path (ascend_config.enable_mxfp4_kv), so
-    dense MXFP4 shares the config surface instead of a kv_cache_dtype hack.
-    Ascend config may not be initialized yet when the patch loads, in which
-    case treat MXFP4 as disabled rather than crashing.
-    """
     try:
-        enabled = getattr(get_ascend_config(), "enable_mxfp4_kv", False)
+        from vllm_ascend.ascend_config import get_ascend_config
+        ascend_config = get_ascend_config()
+        vllm_config = getattr(ascend_config, "vllm_config", None)
+        if vllm_config is None:
+            return False
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        return bool(additional_config.get("enable_mxfp4_kv", False))
     except RuntimeError:
-        logger.info_once("[mxfp4_kv] ascend_config not initialized yet, mxfp4 disabled for now")
+        # ascend_config not initialized yet (patch loaded before worker init)
         return False
-    logger.info_once("[mxfp4_kv] enable_mxfp4_kv = %s", enabled)
-    return enabled
 
 
 _ROTATION_MATRICES: dict[tuple, torch.Tensor] = {}
@@ -198,8 +195,8 @@ def _scatter_mxfp4_kv_and_scales(
     num_actual = attn_metadata.num_actual_tokens
 
     torch_npu.npu_scatter_pa_kv_cache(
-        key=key_mxfp4[:num_actual].contiguous(),
-        value=value_mxfp4[:num_actual].contiguous(),
+        key=key_mxfp4[:num_actual].view(torch.uint8).contiguous(),
+        value=value_mxfp4[:num_actual].view(torch.uint8).contiguous(),
         key_cache=self.key_cache,
         value_cache=self.value_cache,
         slot_mapping=slots[:num_actual].contiguous(),
@@ -208,8 +205,8 @@ def _scatter_mxfp4_kv_and_scales(
 
     if self.mxfp4_k_scale_cache is not None:
         torch_npu.npu_scatter_pa_kv_cache(
-            key=k_scales[:num_actual].contiguous(),
-            value=v_scales[:num_actual].contiguous(),
+            key=k_scales[:num_actual].view(torch.uint8).contiguous(),
+            value=v_scales[:num_actual].view(torch.uint8).contiguous(),
             key_cache=self.mxfp4_k_scale_cache,
             value_cache=self.mxfp4_v_scale_cache,
             slot_mapping=slots[:num_actual].contiguous(),
@@ -225,7 +222,7 @@ def _mxfp4_forward(
     self, layer, query, key, value, kv_cache, attn_metadata,
     output=None, output_scale=None, output_block_scale=None
 ):
-    if getattr(self, "enable_mxfp4_kv_cache", False):
+    if getattr(self, "enable_mxfp4_kv_cache", False) and attn_metadata is not None:
         # Record the layer name so graph replay can match metadata by name
         # instead of relying on attn_metadata iteration order (mirrors
         # upstream layer-aware replay for mixed-attention models).
@@ -245,10 +242,6 @@ AscendAttentionBackendImpl.forward = _mxfp4_forward
 def _forward_mxfp4(
     self, layer, query, key, value, kv_cache, attn_metadata, output,
 ) -> torch.Tensor:
-    # Mirror upstream forward's cache bootstrap: when key/value are None
-    # (e.g. pooling / encoder-only paths) the cache may never be bound via
-    # _scatter_mxfp4_kv_and_scales, so bind it here to keep later
-    # self.key_cache.shape accesses safe.
     if self.key_cache is None and kv_cache is not None:
         if (
             isinstance(kv_cache, torch.Tensor)
@@ -258,6 +251,22 @@ def _forward_mxfp4(
             and len(kv_cache) >= 2
         ):
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+
+    if (
+        self.mxfp4_k_scale_cache is None
+        and self.key_cache is not None
+        and self.key_cache.dim() == 4
+    ):
+        num_blocks, block_size = self.key_cache.shape[0], self.key_cache.shape[1]
+        scale_dim = self.key_cache.shape[-1] // 16
+        self.mxfp4_k_scale_cache = torch.zeros(
+            num_blocks, block_size, self.num_kv_heads, scale_dim,
+            dtype=torch.uint8, device=self.key_cache.device,
+        )
+        self.mxfp4_v_scale_cache = torch.zeros(
+            num_blocks, block_size, self.num_kv_heads, scale_dim,
+            dtype=torch.uint8, device=self.key_cache.device,
+        )
 
     float_key, float_value = None, None
     if key is not None and value is not None:
@@ -1000,7 +1009,7 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
     kv_caches = _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors)
 
     for group in self._kv_cache_spec_attn_group_iterator():
-        current_kv_cache_spec = group.kv_cache_spec 
+        current_kv_cache_spec = group.kv_cache_spec
         for layer_name in group.layer_names:
             if layer_name in self.runner_only_attn_layers:
                 continue
@@ -1010,16 +1019,15 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
             if not isinstance(current_kv_cache_spec, AscendFullAttentionC4Spec):
                 continue
             raw = kv_cache_raw_tensors.get(layer_name)
-            if not isinstance(raw, tuple) or len(raw) != 2:
+
+            # Get actual block layout from the standard reshape result.
+            orig_result = kv_caches.get(layer_name)
+            if not isinstance(orig_result, tuple) or len(orig_result) < 1:
                 continue
-
-            raw_k_tensor, raw_v_tensor = raw
-
-            # Only the block layout is needed from the original reshape; the
-            # raw tensors below are re-carved into data + scale views.
-            orig_k_cache = kv_caches[layer_name][0]
+            orig_k_cache = orig_result[0]
             actual_num_blocks = orig_k_cache.shape[0]
             actual_block_size = orig_k_cache.shape[1]
+
             # With AscendFullAttentionC4Spec, head_size / head_size_v are the
             # packed float4 data dims (head//2) and scale_dim / scale_dim_v are
             # the per-32-group e8m0 scales (head//32). Each raw tensor holds the
@@ -1035,19 +1043,38 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
             k_scale_numel = actual_num_blocks * actual_block_size * nk * sk
             v_data_numel = actual_num_blocks * actual_block_size * nk * hs_v
             v_scale_numel = actual_num_blocks * actual_block_size * nk * sv
-            raw_k = raw_k_tensor.view(torch.uint8)
-            raw_v = raw_v_tensor.view(torch.uint8)
-            k_cache = raw_k[:k_data_numel].view(
-                actual_num_blocks, actual_block_size, nk, hs_k)
-            k_scale_cache = raw_k[k_data_numel:k_data_numel + k_scale_numel].view(
-                actual_num_blocks, actual_block_size, nk, sk)
-            v_cache = raw_v[:v_data_numel].view(
-                actual_num_blocks, actual_block_size, nk, hs_v)
-            v_scale_cache = raw_v[v_data_numel:v_data_numel + v_scale_numel].view(
-                actual_num_blocks, actual_block_size, nk, sv)
+
+            if isinstance(raw, tuple) and len(raw) == 2:
+                # Non-hybrid: separate K and V raw tensors.
+                raw_k_tensor, raw_v_tensor = raw
+                raw_k = raw_k_tensor.view(torch.uint8)
+                raw_v = raw_v_tensor.view(torch.uint8)
+                k_cache = raw_k[:k_data_numel].view(
+                    actual_num_blocks, actual_block_size, nk, hs_k)
+                k_scale_cache = raw_k[k_data_numel:k_data_numel + k_scale_numel].view(
+                    actual_num_blocks, actual_block_size, nk, sk)
+                v_cache = raw_v[:v_data_numel].view(
+                    actual_num_blocks, actual_block_size, nk, hs_v)
+                v_scale_cache = raw_v[v_data_numel:v_data_numel + v_scale_numel].view(
+                    actual_num_blocks, actual_block_size, nk, sv)
+            elif isinstance(raw, torch.Tensor):
+                c4_total = k_data_numel + k_scale_numel + v_data_numel + v_scale_numel
+                raw_u8 = raw.view(torch.uint8)
+                base = raw_u8.numel() - c4_total
+                k_cache = raw_u8[base:base + k_data_numel].view(
+                    actual_num_blocks, actual_block_size, nk, hs_k)
+                k_scale_cache = raw_u8[base + k_data_numel:base + k_data_numel + k_scale_numel].view(
+                    actual_num_blocks, actual_block_size, nk, sk)
+                v_base = base + k_data_numel + k_scale_numel
+                v_cache = raw_u8[v_base:v_base + v_data_numel].view(
+                    actual_num_blocks, actual_block_size, nk, hs_v)
+                v_scale_cache = raw_u8[v_base + v_data_numel:v_base + v_data_numel + v_scale_numel].view(
+                    actual_num_blocks, actual_block_size, nk, sv)
+            else:
+                continue
 
             kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
-        
+
     return kv_caches
 
 NPUModelRunner._reshape_kv_cache_tensors = _mxfp4_reshape_kv_cache_tensors
@@ -1057,13 +1084,17 @@ _orig_get_kv_cache_spec = NPUModelRunner.get_kv_cache_spec
 
 def _mxfp4_get_kv_cache_spec(self) -> dict:
     kv_cache_spec = _orig_get_kv_cache_spec(self)
-    if not _is_mxfp4_kv_enabled():
+    enabled = _is_mxfp4_kv_enabled()
+    logger.info("[mxfp4_kv] _is_mxfp4_kv_enabled() = %s in get_kv_cache_spec", enabled)
+    if not enabled:
         return kv_cache_spec
     replaced = 0
     for layer_name, spec in kv_cache_spec.items():
         if isinstance(spec, FullAttentionSpec) and not isinstance(
             spec, AscendFullAttentionC4Spec
         ):
+            orig_page_size = spec.page_size_bytes
+            orig_real_page_size = spec.real_page_size_bytes
             # MXFP4: head_size / head_size_v are the packed float4 data dims
             # (head//2); scale_dim / scale_dim_v are the per-32-group e8m0
             # scales (head//32). Data and scale are separate regions of one
@@ -1079,7 +1110,6 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
                 scale_dim=mxfp4_kv_cache_scale_dim(spec.head_size),
                 scale_dim_v=mxfp4_kv_cache_scale_dim(spec.head_size_v),
                 page_size_padded=spec.page_size_padded,
-                indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride,
             )
             replaced += 1
     logger.info(
