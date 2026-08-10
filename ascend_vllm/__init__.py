@@ -93,16 +93,8 @@ def register_general_plugin_patch():
 # happens in every process) and intercept imports that occur naturally during
 # vllm startup, then trigger the matching ModelArts patch package:
 #
-# * ``vllm_ascend.ops``          → ``ascend_vllm.patch.platform``
-# * ``vllm_ascend.patch.worker`` → ``ascend_vllm.patch.worker``
-#
-# The worker process imports ``vllm_ascend.ops`` in ``NPUWorker.__init__`` and
-# imports ``vllm_ascend.patch.worker`` via ``adapt_patch()`` right before the
-# worker class is instantiated — the ideal trigger for the MXFP4 worker patch,
-# which must be loaded before any attention backend is created. Hooking these
-# imports keeps patch loading reliable regardless of whether
-# ``pre_register_and_update`` is called or ``VLLM_PLUGINS`` filters
-# general_plugins entry points.
+# * ``vllm_ascend.ops``                       → ``ascend_vllm.patch.platform``
+# * ``vllm_ascend.worker.model_runner_v1``    → ``ascend_vllm.patch.worker``
 # ---------------------------------------------------------------------------
 
 
@@ -165,4 +157,4 @@ def _load_worker_patches():
 
 
 _install_patch_import_hook("vllm_ascend.ops", _load_platform_patches)
-_install_patch_import_hook("vllm_ascend.patch.worker", _load_worker_patches)
+_install_patch_import_hook("vllm_ascend.worker.model_runner_v1", _load_worker_patches)
