@@ -3,7 +3,8 @@ import math
 import torch
 import torch_npu
 from vllm.logger import logger
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode, MambaSpec
 
 try:
     from scipy.linalg import hadamard as _hadamard
@@ -251,7 +252,6 @@ def _forward_mxfp4(
             and len(kv_cache) >= 2
         ):
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
-
     if (
         self.mxfp4_k_scale_cache is None
         and self.key_cache is not None
@@ -1028,11 +1028,6 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
             actual_num_blocks = orig_k_cache.shape[0]
             actual_block_size = orig_k_cache.shape[1]
 
-            # With AscendFullAttentionC4Spec, head_size / head_size_v are the
-            # packed float4 data dims (head//2) and scale_dim / scale_dim_v are
-            # the per-32-group e8m0 scales (head//32). Each raw tensor holds the
-            # data region first, then the scale region, as separate views
-            # managed by the same block table.
             hs_k = current_kv_cache_spec.head_size
             hs_v = getattr(current_kv_cache_spec, "head_size_v", hs_k) or hs_k
             sk = getattr(current_kv_cache_spec, "scale_dim", 0)
@@ -1088,18 +1083,12 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
     logger.info("[mxfp4_kv] _is_mxfp4_kv_enabled() = %s in get_kv_cache_spec", enabled)
     if not enabled:
         return kv_cache_spec
+    c4_real_page_size = None
     replaced = 0
-    for layer_name, spec in kv_cache_spec.items():
+    for layer_name, spec in list(kv_cache_spec.items()):
         if isinstance(spec, FullAttentionSpec) and not isinstance(
             spec, AscendFullAttentionC4Spec
         ):
-            orig_page_size = spec.page_size_bytes
-            orig_real_page_size = spec.real_page_size_bytes
-            # MXFP4: head_size / head_size_v are the packed float4 data dims
-            # (head//2); scale_dim / scale_dim_v are the per-32-group e8m0
-            # scales (head//32). Data and scale are separate regions of one
-            # page, managed by the same block table, so vLLM allocates the
-            # exact MXFP4 layout from the custom spec - no kv_cache_dtype.
             kv_cache_spec[layer_name] = AscendFullAttentionC4Spec(
                 block_size=spec.block_size,
                 num_kv_heads=spec.num_kv_heads,
@@ -1109,13 +1098,40 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
                 kv_quant_mode=KVQuantMode.NONE,
                 scale_dim=mxfp4_kv_cache_scale_dim(spec.head_size),
                 scale_dim_v=mxfp4_kv_cache_scale_dim(spec.head_size_v),
-                page_size_padded=spec.page_size_padded,
+                page_size_padded=None,
             )
+            c4_real_page_size = kv_cache_spec[layer_name].real_page_size_bytes
             replaced += 1
+
     logger.info(
         "[mxfp4_kv] replaced %d dense attention spec(s) with AscendFullAttentionC4Spec",
         replaced,
     )
+    if replaced == 0 or c4_real_page_size is None:
+        return kv_cache_spec
+
+    mamba_specs = [
+        (n, s) for n, s in kv_cache_spec.items() if isinstance(s, MambaSpec)
+    ]
+    if mamba_specs:
+        max_mamba_real = max(
+            sum(math.prod(shape) * get_dtype_size(dtype)
+                for shape, dtype in zip(s.shapes, s.dtypes))
+            for _, s in mamba_specs
+        )
+        new_page_size = max_mamba_real + c4_real_page_size
+        for layer_name, spec in kv_cache_spec.items():
+            if isinstance(spec, (MambaSpec, AscendFullAttentionC4Spec)):
+                continue
+            other_ps = getattr(spec, "page_size_bytes", 0)
+            if other_ps > new_page_size:
+                new_page_size = other_ps
+
+        for layer_name, spec in kv_cache_spec.items():
+            if isinstance(spec, (MambaSpec, AscendFullAttentionC4Spec)):
+                object.__setattr__(spec, "page_size_padded", new_page_size)
+            elif getattr(spec, "page_size_padded", None) is not None:
+                object.__setattr__(spec, "page_size_padded", new_page_size)
     return kv_cache_spec
 
 
