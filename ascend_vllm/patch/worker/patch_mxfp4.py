@@ -252,6 +252,9 @@ def _forward_mxfp4(
             and len(kv_cache) >= 2
         ):
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+            if len(kv_cache) >= 4:
+                self.mxfp4_k_scale_cache = kv_cache[2]
+                self.mxfp4_v_scale_cache = kv_cache[3]
     if (
         self.mxfp4_k_scale_cache is None
         and self.key_cache is not None
