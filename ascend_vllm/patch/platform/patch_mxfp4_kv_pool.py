@@ -538,7 +538,6 @@ def _patched_get_num_blocks_to_allocate(
     new_computed_blocks,
     num_encoder_tokens,
     total_computed_tokens,
-    num_local_computed_tokens,
     num_tokens_main_model,
     apply_admission_cap=False,
 ):
@@ -551,7 +550,6 @@ def _patched_get_num_blocks_to_allocate(
             new_computed_blocks,
             num_encoder_tokens,
             total_computed_tokens,
-            num_local_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap=apply_admission_cap,
         )
@@ -565,7 +563,6 @@ def _patched_get_num_blocks_to_allocate(
                 num_encoder_tokens,
                 [],
                 0,
-                0,
                 num_encoder_tokens,
                 apply_admission_cap=apply_admission_cap,
             )
@@ -575,7 +572,6 @@ def _patched_get_num_blocks_to_allocate(
             num_tokens,
             new_computed_blocks[i],
             total_computed_tokens,
-            num_local_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap=apply_admission_cap,
         )
@@ -593,7 +589,6 @@ def _patched_get_num_blocks_to_allocate(
     # Only the attention demand is charged against the main (attention)
     # pool; the mamba demand was validated against the mamba pool above.
     return attn_demand
-
 
 KVCacheCoordinator.get_num_blocks_to_allocate = (
     _patched_get_num_blocks_to_allocate
