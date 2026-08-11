@@ -12,3 +12,5 @@ from ascend_vllm.patch.worker import (
     patch_mooncake_hybrid_connector as patch_mooncake_hybrid_connector,
 )
 from ascend_vllm.patch.worker import patch_mxfp4
+from ascend_vllm.patch.worker import patch_mxfp4_cow
+from ascend_vllm.patch.worker import patch_kv_cache_zeroing

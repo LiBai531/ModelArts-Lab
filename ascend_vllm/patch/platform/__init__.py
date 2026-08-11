@@ -18,6 +18,12 @@ from ascend_vllm.patch.platform import patch_envs as patch_envs  # noqa: F401
 # import it for spec creation. Enabled via additional-config enable_mxfp4_kv.
 from ascend_vllm.patch.platform import patch_mxfp4_cache_config as patch_mxfp4_cache_config
 
+# MXFP4 dual block pool: separate mamba/attention block pools with per-type
+# real page sizes (no mamba+C4 sum padding). Patches KV cache config
+# building, the KV cache coordinator (second BlockPool for mamba groups) and
+# the admission accounting. Knob: mxfp4_mamba_pool_ratio (default 3).
+from ascend_vllm.patch.platform import patch_mxfp4_kv_pool as patch_mxfp4_kv_pool
+
 # patch_chunk_fla computes chunk_offsets_idx on-the-fly from cu_seqlens
 # (fallback), so patch_gdn_attn_builder / patch_gdn_chunk_meta are no longer
 # needed — the upstream gdn_attn_builder.py was refactored to drop the old

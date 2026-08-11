@@ -28,6 +28,32 @@ def mxfp4_kv_cache_scale_dim(head_size: int) -> int:
     return head_size // 32
 
 
+# ---------------------------------------------------------------------------
+# Dual block pool (mamba pool + attention pool) shared constants.
+#
+# In dual-pool mode the mamba block pool is sized as
+# ``ratio * kv_cache_config.num_blocks`` where ``num_blocks`` counts the
+# attention pool. The integer ratio is attached to every mamba group spec
+# under this attribute name by the platform config builder, and read back by
+# the scheduler-side coordinator patch and the worker-side reshape patch.
+# Keeping a ratio (instead of an absolute block count) makes the layout
+# survive the cross-worker min-num_blocks shrink in ``get_kv_cache_configs``:
+# mamba tensors are sized ``num_blocks * ratio * mamba_page``, so the uniform
+# proportional shrink scales both pools consistently.
+# ---------------------------------------------------------------------------
+MXFP4_MAMBA_POOL_RATIO_ATTR = "mxfp4_mamba_blocks_per_attn_block"
+
+# Default: mamba pool holds 3 blocks per attention-pool block, matching the
+# typical linear:full = 3:1 layer ratio so both pools cache about the same
+# number of prefix boundaries.
+MXFP4_MAMBA_POOL_RATIO_DEFAULT = 3
+
+
+def get_mxfp4_mamba_pool_ratio(spec) -> int | None:
+    """Return the dual-pool ratio carried by a (mamba) spec, or None."""
+    return getattr(spec, MXFP4_MAMBA_POOL_RATIO_ATTR, None)
+
+
 @dataclass(frozen=True, kw_only=True)
 class AscendFullAttentionC4Spec(kv_iface.FullAttentionSpec):
     """Full attention spec for C4 (MXFP4) KV cache.

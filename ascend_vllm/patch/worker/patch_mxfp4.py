@@ -1,10 +1,15 @@
 import math
+from dataclasses import replace
 
 import torch
 import torch_npu
 from vllm.logger import logger
-from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    KVQuantMode,
+    MambaSpec,
+)
 
 try:
     from scipy.linalg import hadamard as _hadamard
@@ -26,6 +31,7 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 from ascend_vllm.patch.platform.patch_mxfp4_cache_config import (
     AscendFullAttentionC4Spec,
+    get_mxfp4_mamba_pool_ratio,
     mxfp4_kv_cache_data_dim,
     mxfp4_kv_cache_scale_dim,
 )
@@ -184,13 +190,33 @@ def _scatter_mxfp4_kv_and_scales(
     k_scales, v_scales,
     kv_cache, attn_metadata
 ):
-    if not isinstance(kv_cache, list | tuple) or len(kv_cache) < 2:
-        return
-    
-    if kv_cache[0] is not self.key_cache:
-        self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
-    if len(kv_cache) >= 4 and kv_cache[2] is not self.mxfp4_k_scale_cache:
-        self.mxfp4_k_scale_cache, self.mxfp4_v_scale_cache = kv_cache[2], kv_cache[3]
+    if isinstance(kv_cache, torch.Tensor):
+        # Packed (2, n_blocks, block_size, n_kv_heads, head_dim) fallback layout:
+        # kv_cache[0] is K and kv_cache[1] is V. This layout carries no scale
+        # region, so the scale caches come from the lazy-init fallback in
+        # _forward_mxfp4.
+        if kv_cache.dim() < 1 or kv_cache.shape[0] != 2:
+            raise ValueError(
+                "mxfp4 kv cache tensor must be shaped (2, n_blocks, ...), "
+                f"got {tuple(kv_cache.shape)}"
+            )
+        if kv_cache[0] is not self.key_cache:
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+    elif isinstance(kv_cache, (list, tuple)):
+        if len(kv_cache) < 2:
+            raise ValueError(
+                f"mxfp4 kv cache tuple must carry at least (K, V), "
+                f"got {len(kv_cache)} element(s)"
+            )
+        if kv_cache[0] is not self.key_cache:
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+        if len(kv_cache) >= 4 and kv_cache[2] is not self.mxfp4_k_scale_cache:
+            self.mxfp4_k_scale_cache, self.mxfp4_v_scale_cache = kv_cache[2], kv_cache[3]
+    else:
+        raise ValueError(
+            f"mxfp4 kv cache must be a tensor or a list/tuple of caches, "
+            f"got {type(kv_cache).__name__}"
+        )
 
     slots = attn_metadata.slot_mapping
     num_actual = attn_metadata.num_actual_tokens
@@ -290,6 +316,10 @@ def _forward_mxfp4(
         AscendAttentionState.SpecDecoding
     ):
         if _EXTRA_CTX.capturing:
+            logger.debug(
+                "[mxfp4_kv] capturing decode graph for layer=%s state=%s "
+                "(mxfp4 path)", self._layer_name, attn_metadata.attn_state,
+            )
             attn_output, num_tokens = self.full_graph_mxfp4_decode(
                 query, attn_metadata, output
             )
@@ -364,6 +394,12 @@ def full_graph_mxfp4_decode(
     v_scale = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
 
     if workspace is None:
+        logger.warning(
+            "[mxfp4_kv] workspace not precomputed for num_tokens=%d; "
+            "computing inside graph capture (check _precompute_mxfp4_workspaces "
+            "coverage)",
+            num_tokens,
+        )
         workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
             query=query[:num_tokens],
             key=key_3d,
@@ -836,7 +872,28 @@ def _mxfp4_update_graph_params(
                 ) = param
                 if _EXTRA_CTX.is_draft_model:
                     draft_step, key = draft_attn_key_steps[attn_count]
-                    meta = attn_metadata[draft_step][key]
+                    # (draft_step, layer_name) dual-key resolution: prefer the
+                    # captured layer name within the current draft step's
+                    # metadata dict, falling back to the positional key. Covers
+                    # Step3.5 (each step holds only that step's group layers)
+                    # and generic MTP (all layers share one step) regardless of
+                    # capture/enumeration order.
+                    per_step_meta = attn_metadata[draft_step]
+                    meta = per_step_meta.get(layer_name, per_step_meta.get(key))
+                    if meta is None:
+                        raise KeyError(
+                            "draft step %d has no metadata for layer %r "
+                            "(fallback key %r)" % (draft_step, layer_name, key)
+                        )
+                    if layer_name is None or layer_name not in per_step_meta:
+                        logger.warning(
+                            "[mxfp4_kv] draft step %d resolved metadata by "
+                            "positional key %r (captured layer_name %r absent "
+                            "from step dict); verify draft capture/replay order",
+                            draft_step,
+                            key,
+                            layer_name,
+                        )
                     seq_lens = meta.seq_lens_list
                     actual_seq_lengths_q = meta.actual_seq_lengths_q
                     block_tables = meta.block_tables
@@ -975,8 +1032,16 @@ def _precompute_mxfp4_workspaces(self):
                 mtp_qlen = torch.arange(
                     step, num_tokens + 1, step,
                     dtype=torch.int32, device=device)
-                mtp_mask = torch.zeros(
-                    2048, 2048, dtype=torch.bool, device=device)
+                # Mirrors the fixed causal mask the FIA v2 op actually receives
+                # (AttentionMaskBuilder.get_splitfuse_attn_mask: 2048x2048 int8
+                # upper-triangle), so the workspace estimate matches the real
+                # graph input shape/dtype instead of an all-zero bool placeholder.
+                mtp_mask = (
+                    torch.triu(
+                        torch.ones(2048, 2048, device=device, dtype=torch.int8),
+                        diagonal=1,
+                    )
+                )
                 mtp_ws = _ws_for_pattern(
                     impl, num_tokens, mtp_batch, mtp_qlen, 3, mtp_mask)
                 if mtp_ws.numel() > best.numel():
@@ -1000,16 +1065,87 @@ def _precompute_mxfp4_workspaces(self):
                 else:
                     update_draft_graph_params_workspaces(nt, _compute_workspace(nt))
 
+    logger.info(
+        "[mxfp4_kv] precomputed graph workspaces for %d unique attention "
+        "shape(s) (main=%s, draft=%s, step=%d); missing sizes will recompute "
+        "inside graph capture",
+        len(unique_impls),
+        sorted(graph_params.workspaces) if graph_params is not None else [],
+        sorted(draft_graph_params.workspaces) if draft_graph_params is not None else [],
+        step,
+    )
+
 NPUModelRunner._precompute_mxfp4_workspaces = _precompute_mxfp4_workspaces
 
 _orig_reshape = NPUModelRunner._reshape_kv_cache_tensors
+
+
+def _mxfp4_dual_pool_reshape_config(kv_cache_config):
+    """Build the config view passed to the stock reshape in dual-pool mode.
+
+    Returns None when dual pool is not active (no mamba group spec carries
+    the pool-ratio attribute). Otherwise returns a copy where:
+
+    - ``num_blocks`` is ``min(mamba_pool, attention_pool)`` so the per-layer
+      ``num_blocks >= kv_cache_config.num_blocks`` asserts in the stock
+      reshape hold for both pools (the mamba pool has ``ratio * num_blocks``
+      blocks);
+    - each ``AscendFullAttentionC4Spec`` is presented as a plain
+      ``FullAttentionSpec`` whose head dims fold in the scale bytes
+      (head+scale), so its page size equals the C4 page and the stock
+      reshape views the raw K/V slabs exactly. This wrapper then re-carves
+      the data/scale views from the raw tensors as before.
+    """
+    ratio = None
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            r = get_mxfp4_mamba_pool_ratio(spec)
+            if r is not None:
+                ratio = r
+                break
+    if ratio is None:
+        return None
+    new_groups = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, AscendFullAttentionC4Spec):
+            merged_spec = FullAttentionSpec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=spec.head_size + spec.scale_dim,
+                head_size_v=spec.head_size_v + spec.scale_dim_v,
+                dtype=spec.dtype,
+            )
+            assert merged_spec.page_size_bytes == spec.page_size_bytes, (
+                f"merged C4 view page {merged_spec.page_size_bytes} != "
+                f"C4 page {spec.page_size_bytes}"
+            )
+            new_groups.append(
+                KVCacheGroupSpec(
+                    group.layer_names,
+                    merged_spec,
+                    is_eagle_group=group.is_eagle_group,
+                )
+            )
+        else:
+            new_groups.append(group)
+    n_m = ratio * kv_cache_config.num_blocks
+    return replace(
+        kv_cache_config,
+        num_blocks=min(n_m, kv_cache_config.num_blocks),
+        kv_cache_groups=new_groups,
+    )
 
 
 def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors):
     if not _is_mxfp4_kv_enabled():
         return _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors)
 
-    kv_caches = _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors)
+    config_for_orig = _mxfp4_dual_pool_reshape_config(kv_cache_config)
+    if config_for_orig is None:
+        config_for_orig = kv_cache_config
+    kv_caches = _orig_reshape(self, config_for_orig, kv_cache_raw_tensors)
 
     for group in self._kv_cache_spec_attn_group_iterator():
         current_kv_cache_spec = group.kv_cache_spec
@@ -1092,6 +1228,15 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
         if isinstance(spec, FullAttentionSpec) and not isinstance(
             spec, AscendFullAttentionC4Spec
         ):
+            # MXFP4 quantizes K/V in per-32-element groups (e8m0 scale), so the
+            # packed data dim head//2 and scale dim head//32 are only exact when
+            # head_size is a multiple of 32. Fail loudly instead of silently
+            # misplacing the scale region.
+            assert spec.head_size % 32 == 0 and spec.head_size_v % 32 == 0, (
+                "mxfp4 kv cache requires head_size % 32 == 0 (scale group "
+                f"size), got head_size={spec.head_size}, "
+                f"head_size_v={spec.head_size_v}"
+            )
             kv_cache_spec[layer_name] = AscendFullAttentionC4Spec(
                 block_size=spec.block_size,
                 num_kv_heads=spec.num_kv_heads,
@@ -1110,31 +1255,37 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
         "[mxfp4_kv] replaced %d dense attention spec(s) with AscendFullAttentionC4Spec",
         replaced,
     )
-    if replaced == 0 or c4_real_page_size is None:
-        return kv_cache_spec
 
+    # Clear the mamba page_size_padded before the early return: dual block pool
+    # must keep the mamba spec at its real page size even when no dense
+    # attention layer was replaced on this call, otherwise the uniform page
+    # assert in _patched_get_kv_cache_config_from_groups would trip on a padded
+    # mamba page.
     mamba_specs = [
         (n, s) for n, s in kv_cache_spec.items() if isinstance(s, MambaSpec)
     ]
     if mamba_specs:
-        max_mamba_real = max(
-            sum(math.prod(shape) * get_dtype_size(dtype)
-                for shape, dtype in zip(s.shapes, s.dtypes))
-            for _, s in mamba_specs
-        )
-        new_page_size = max_mamba_real + c4_real_page_size
+        # Dual block pool: every spec keeps its REAL page size (mamba:
+        # conv+ssm bytes per block; C4: data+scale bytes per block) and the
+        # two cache types draw block ids from separate pools (see
+        # ascend_vllm.patch.platform.patch_mxfp4_kv_pool). Clear the
+        # page_size_padded inherited from the vllm-ascend mamba config patch
+        # (bf16 attention page + conv) so the mamba pool allocates real state
+        # bytes per block.
         for layer_name, spec in kv_cache_spec.items():
-            if isinstance(spec, (MambaSpec, AscendFullAttentionC4Spec)):
-                continue
-            other_ps = getattr(spec, "page_size_bytes", 0)
-            if other_ps > new_page_size:
-                new_page_size = other_ps
+            if isinstance(spec, MambaSpec) and spec.page_size_padded is not None:
+                object.__setattr__(spec, "page_size_padded", None)
 
-        for layer_name, spec in kv_cache_spec.items():
-            if isinstance(spec, (MambaSpec, AscendFullAttentionC4Spec)):
-                object.__setattr__(spec, "page_size_padded", new_page_size)
-            elif getattr(spec, "page_size_padded", None) is not None:
-                object.__setattr__(spec, "page_size_padded", new_page_size)
+    if replaced == 0 or c4_real_page_size is None:
+        return kv_cache_spec
+
+    if mamba_specs:
+        logger.info(
+            "[mxfp4_kv] dual block pool: %d mamba spec(s) at real page size, "
+            "C4 page %d bytes (no cross-type page padding)",
+            len(mamba_specs),
+            c4_real_page_size,
+        )
     return kv_cache_spec
 
 
