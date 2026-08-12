@@ -85,6 +85,18 @@ def _get_orthogonal_block(
     return _ROTATION_MATRICES[key]
 
 
+def _rotation_block(device, dtype):
+    """Cached Hadamard rotation matrix for device/dtype (fallback build).
+
+    Returns the class-level bf16 block when it matches, else builds one for the
+    given device/dtype. Shared by the query and K rotation paths.
+    """
+    Q = AscendAttentionBackendImpl._hadamard_32
+    if Q is None or Q.dtype != dtype or Q.device != device:
+        Q = _get_orthogonal_block(device=device, dtype=dtype)
+    return Q
+
+
 AscendAttentionBackendImpl._hadamard_32 = None
 
 _orig_attn_init = AscendAttentionBackendImpl.__init__
@@ -138,9 +150,7 @@ AscendAttentionBackendImpl._v_scale_fp8 = property(_v_scale_fp8)
 
 
 def _rotate(self, x: torch.Tensor) -> torch.Tensor:
-    Q = AscendAttentionBackendImpl._hadamard_32
-    if Q is None or Q.dtype != x.dtype or Q.device != x.device:
-        Q = _get_orthogonal_block(device=x.device, dtype=x.dtype)
+    Q = _rotation_block(x.device, x.dtype)
     original_shape = x.shape
     x = x.reshape(-1, MXFP4_SCALE_GROUP_SIZE)
     x = x @ Q
@@ -163,11 +173,7 @@ def _quantize_kv_to_mxfp4(
     # padding slots use slot_mapping=-1 (scatter no-op). Avoid creating any
     # tensor here -- the Hadamard block is a cached per-(device,dtype) buffer
     # built eagerly, so capture stays free of host-side allocation.
-    Q = AscendAttentionBackendImpl._hadamard_32
-    if Q is None or Q.dtype != actual_key.dtype or Q.device != actual_key.device:
-        Q = _get_orthogonal_block(
-            device=actual_key.device, dtype=actual_key.dtype
-        )
+    Q = _rotation_block(actual_key.device, actual_key.dtype)
 
     key_mxfp4, k_scales = torch_npu.npu_rotate_quant(
         actual_key,
@@ -203,27 +209,32 @@ def _scatter_mxfp4_kv_and_scales(
         # region, so the scale caches come from the lazy-init fallback in
         # _forward_mxfp4.
         if kv_cache.dim() < 1 or kv_cache.shape[0] != 2:
-            raise ValueError(
-                "mxfp4 kv cache tensor must be shaped (2, n_blocks, ...), "
-                f"got {tuple(kv_cache.shape)}"
+            logger.warning(
+                "[mxfp4_kv] unexpected kv_cache tensor shape %s; skipping "
+                "K/V scatter",
+                tuple(kv_cache.shape),
             )
+            return
         if kv_cache[0] is not self.key_cache:
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
     elif isinstance(kv_cache, (list, tuple)):
         if len(kv_cache) < 2:
-            raise ValueError(
-                f"mxfp4 kv cache tuple must carry at least (K, V), "
-                f"got {len(kv_cache)} element(s)"
+            logger.warning(
+                "[mxfp4_kv] unexpected kv_cache tuple length %d; skipping "
+                "K/V scatter",
+                len(kv_cache),
             )
+            return
         if kv_cache[0] is not self.key_cache:
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
         if len(kv_cache) >= 4 and kv_cache[2] is not self.mxfp4_k_scale_cache:
             self.mxfp4_k_scale_cache, self.mxfp4_v_scale_cache = kv_cache[2], kv_cache[3]
     else:
-        raise ValueError(
-            f"mxfp4 kv cache must be a tensor or a list/tuple of caches, "
-            f"got {type(kv_cache).__name__}"
+        logger.warning(
+            "[mxfp4_kv] unexpected kv_cache type %s; skipping K/V scatter",
+            type(kv_cache).__name__,
         )
+        return
 
     slots = attn_metadata.slot_mapping
     num_actual = attn_metadata.num_actual_tokens
@@ -828,7 +839,13 @@ def _mxfp4_update_graph_params(
                     for k in attn_keys
                     if re.search(r"(?:^|\.)layers\.(\d+)\.self_attn\.attn$", k)
                 ]
-                if direct_target_keys:
+                if not direct_target_keys:
+                    logger.warning(
+                        "[mxfp4_kv] MTP target layer-name pattern matched no "
+                        "attn_metadata key (%d total); replay may misalign",
+                        len(attn_keys),
+                    )
+                else:
                     attn_keys = direct_target_keys
             # No sorting: each captured param carries its own layer name and
             # replay looks the metadata up by name (see metadata_key below),
@@ -864,11 +881,11 @@ def _mxfp4_update_graph_params(
                 block_size, seq_lens, actual_seq_lengths_q,
                 num_kv_heads, num_heads, scale,
                 attn_output, softmax_lse,
-                sparse_mode, pre_tokens, next_tokens,
+                sparse_mode, _pre_tokens, _next_tokens,
                 c8_k_aq_scale,
-                c8_k_aq_offset,
+                _c8_k_aq_offset,
                 c8_v_aq_scale,
-                c8_v_aq_offset,
+                _c8_v_aq_offset,
                 mxfp4_query_rot,
                 mxfp4_orig_query,
                 layer_name
@@ -898,14 +915,10 @@ def _mxfp4_update_graph_params(
                 
                 if mxfp4_orig_query is not None and mxfp4_query_rot is not None:
                     _q_in = mxfp4_orig_query[:num_tokens]
-                    Q = AscendAttentionBackendImpl._hadamard_32
-                    if Q is None or Q.dtype != _q_in.dtype or Q.device != _q_in.device:
-                        Q = _get_orthogonal_block(
-                            device=_q_in.device, dtype=_q_in.dtype
-                        )
+                    Q = _rotation_block(_q_in.device, _q_in.dtype)
                     _rotated = _q_in.reshape(-1, MXFP4_SCALE_GROUP_SIZE) @ Q
                     query.copy_(_rotated.reshape(_q_in.shape))
-                
+
                 k_scale_4d = c8_k_aq_scale.view(torch.float8_e8m0fnu)
                 v_scale_4d = c8_v_aq_scale.view(torch.float8_e8m0fnu)
 
