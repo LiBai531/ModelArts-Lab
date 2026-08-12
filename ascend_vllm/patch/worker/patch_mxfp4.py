@@ -158,14 +158,11 @@ def _quantize_kv_to_mxfp4(
     actual_key = key[:num_actual_tokens]
     actual_value = value[:num_actual_tokens]
 
-    # K/V write path runs inside the ACL graph capture region (the whole model
-    # forward is wrapped by ACLGraphWrapper). This is safe because key/value and
-    # slot_mapping are stable-address graph inputs whose contents are refreshed
-    # each replay step, and padding slots use slot_mapping=-1 (scatter no-op) --
-    # the same mechanism as the upstream reshape_and_cache in graph mode. Still,
-    # avoid creating any tensor here: the Hadamard block below is a cached
-    # per-(device,dtype) buffer built eagerly in pwal / first forward, so graph
-    # capture stays free of host-side allocation.
+    # K/V write runs inside the ACL graph capture region: key/value and
+    # slot_mapping are stable-address inputs refreshed each replay step, and
+    # padding slots use slot_mapping=-1 (scatter no-op). Avoid creating any
+    # tensor here -- the Hadamard block is a cached per-(device,dtype) buffer
+    # built eagerly, so capture stays free of host-side allocation.
     Q = AscendAttentionBackendImpl._hadamard_32
     if Q is None or Q.dtype != actual_key.dtype or Q.device != actual_key.device:
         Q = _get_orthogonal_block(
@@ -261,8 +258,7 @@ def _mxfp4_forward(
 ):
     if getattr(self, "enable_mxfp4_kv_cache", False) and attn_metadata is not None:
         # Record the layer name so graph replay can match metadata by name
-        # instead of relying on attn_metadata iteration order (mirrors
-        # upstream layer-aware replay for mixed-attention models).
+        # instead of relying on attn_metadata iteration order.
         self._layer_name = layer.layer_name
         return self._forward_mxfp4(
             layer, query, key, value, kv_cache, attn_metadata, output
@@ -370,9 +366,8 @@ def full_graph_mxfp4_decode(
         seq_lens_kv = attn_metadata.seq_lens_list[:batch_size]
 
     if _EXTRA_CTX.is_draft_model:
-        # Align with upstream full_graph_fia: derive from attn_metadata.causal
-        # instead of forcing False, so a q_len>1 draft stays correct. For
-        # sequential MTP (q_len=1) this is equivalent to mode 0.
+        # Draft attention is causal (MTP validates q_len=1+num_spec tokens), so
+        # derive the mask from attn_metadata.causal.
         use_causal_mask = attn_metadata.causal
     else:
         use_causal_mask = num_tokens > batch_size
@@ -453,11 +448,9 @@ def full_graph_mxfp4_decode(
             weak_ref_tensors(_query_rot),
             # Weak ref to the live query tensor: update_graph_params later
             # re-dereferences it to rotate the current step's query into the
-            # fixed-address _query_rot buffer. This relies on vLLM's graph
-            # capture semantics where intermediate tensors (query) are stable
-            # buffers whose contents are overwritten each step, NOT recreated
-            # per forward. If upstream ever switches to per-step allocation,
-            # this weak ref may resolve to None and rotation would be skipped.
+            # fixed-address _query_rot buffer. This relies on graph capture
+            # semantics where query is a stable buffer overwritten each step
+            # (not recreated per forward), so the weak ref stays valid.
             weak_ref_tensors(query),
             self._graph_metadata_layer_name(),
         )
@@ -735,10 +728,7 @@ def _forward_mxfp4_fused_infer_attention(
         # PrefillCacheHit: the prefix is in the paged mxfp4 cache and the new
         # tokens' K/V were already quantized+scattered before this call, so the
         # cache holds the full (prefix+new) KV. Attend over it directly with
-        # FIA v2 dequant (the op dequants fp4/e8m0 internally) instead of a
-        # broken manual dequant. Mirrors upstream _get_fia_params PrefillCacheHit
-        # block_table handling (slice to the real request count, no decode
-        # offset since PrefillCacheHit only occurs with chunked_prefill off).
+        # FIA v2 dequant (the op dequants fp4/e8m0 internally).
         num_block, block_size, _, _ = self.key_cache.shape
         key_bnsd = self.key_cache.view(num_block, block_size, -1)
         value_bnsd = self.value_cache.view(num_block, block_size, -1)
@@ -787,8 +777,7 @@ def _mxfp4_update_graph_params(
     is_mxfp4 = _is_mxfp4_kv_enabled()
 
     if not is_mxfp4:
-        # Non-mxfp4 models: defer to the original implementation so this patch
-        # does not regress vanilla bf16/fp8 graph replay.
+        # Non-mxfp4 models: defer to the original graph replay.
         return _orig_update_graph_params(
             update_stream,
             forward_context,
@@ -811,8 +800,7 @@ def _mxfp4_update_graph_params(
                 graph_params = get_draft_graph_params()
             attn_metadata = draft_attn_metadatas
             # Build (draft_step, key) pairs across all draft steps so captured
-            # attn params replay against the right metadata, matching upstream
-            # update_graph_params draft stepping.
+            # attn params replay against the right metadata.
             draft_attn_key_steps = [
                 (draft_step, key)
                 for draft_step, per_step_metadata in enumerate(attn_metadata)
@@ -826,11 +814,11 @@ def _mxfp4_update_graph_params(
             attn_keys_length = len(graph_params.attn_params[num_tokens])
             if attn_keys_length == 0:
                 return
-            # MTP target 图：forward_context.attn_metadata 混入了 draft KV-cache
-            # group 的 key（model_runner 的 _build_attention_metadata 把全部
-            # group 的层都填进来），而主图只捕获 target 自注意层。过滤出
-            # direct target 层（layers.<N>.self_attn.attn）以避免 zip 时与
-            # 捕获的 FIA op 错位（镜像上游 attention_v1 L657-665）。
+            # MTP target graph: forward_context.attn_metadata also carries draft
+            # KV-cache group keys (_build_attention_metadata fills in all group
+            # layers), while the main graph only captures target self-attention
+            # layers. Filter to direct target layers (layers.<N>.self_attn.attn)
+            # so zip stays aligned with the captured FIA ops.
             if (
                 speculative_config is not None
                 and getattr(speculative_config, "method", None) == "mtp"
@@ -844,9 +832,8 @@ def _mxfp4_update_graph_params(
                     attn_keys = direct_target_keys
             # No sorting: each captured param carries its own layer name and
             # replay looks the metadata up by name (see metadata_key below),
-            # so iteration order is irrelevant. This mirrors upstream
-            # layer-aware replay (gemma4) and is robust to mixed-attention
-            # models where metadata order != layer order.
+            # so iteration order is irrelevant, even for mixed-attention models
+            # where metadata order != layer order.
 
         num_layers = len(attn_keys)
         if num_layers == 0:
@@ -854,7 +841,7 @@ def _mxfp4_update_graph_params(
         graph_param_count = len(graph_params.attn_params[num_tokens])
         if _EXTRA_CTX.is_draft_model:
             # Align (draft_step, key) pairs to the captured param count,
-            # repeating or truncating as needed (upstream uses cdiv here).
+            # repeating or truncating as needed.
             if graph_param_count > len(draft_attn_key_steps):
                 repeat_count = (
                     graph_param_count + len(draft_attn_key_steps) - 1
@@ -896,9 +883,8 @@ def _mxfp4_update_graph_params(
                     if not meta.causal:
                         sparse_mode = 0
                 else:
-                    # Resolve metadata by the captured layer name (falls back
-                    # to the zip key when the name is absent, mirroring
-                    # upstream layer-aware replay).
+                    # Resolve metadata by the captured layer name, falling back
+                    # to the zip key when the name is absent.
                     metadata_key = (
                         layer_name
                         if layer_name is not None and layer_name in attn_metadata
@@ -906,8 +892,8 @@ def _mxfp4_update_graph_params(
                     )
                     seq_lens = attn_metadata[metadata_key].seq_lens_list
                     actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
-                    # mxfp4 targets (Qwen3.5 / GLM5.2) have no sliding window,
-                    # so block_tables always comes from live metadata.
+                    # No sliding window, so block_tables always comes from live
+                    # metadata.
                     block_tables = attn_metadata[metadata_key].block_tables
                 
                 if mxfp4_orig_query is not None and mxfp4_query_rot is not None:
@@ -962,9 +948,8 @@ def _precompute_mxfp4_workspaces(self):
         return
 
     # Collect all mxfp4 attn impls. Layers may have different shapes (e.g. mixed
-    # attention types); take the max workspace across unique shapes, mirroring
-    # upstream use_max_workspace, so a smaller layer's workspace isn't reused
-    # for a larger one.
+    # attention types); take the max workspace across unique shapes so a smaller
+    # layer's workspace isn't reused for a larger one.
     unique_impls = {}
     for layer in self.compilation_config.static_forward_context.values():
         if not (hasattr(layer, "impl") and hasattr(layer.impl, "mxfp4_k_scale_cache")):
@@ -1018,17 +1003,17 @@ def _precompute_mxfp4_workspaces(self):
                 impl, num_tokens, num_tokens, pure_qlen, 0, None)
             if best is None or ws.numel() > best.numel():
                 best = ws
-            # MTP 捕获 size 恒为 step 的整数倍（uniform_decode 的
-            # max_query_len = 1 + num_speculative_tokens），所以只在整除时
-            # 覆盖 MTP（sparse_mode=3）pattern 即可。
+            # MTP capture sizes are always multiples of step (uniform_decode
+            # max_query_len = 1 + num_speculative_tokens), so only cover the
+            # MTP (sparse_mode=3) pattern when num_tokens is divisible by step.
             if step > 1 and num_tokens % step == 0:
                 mtp_batch = num_tokens // step
                 mtp_qlen = torch.arange(
                     step, num_tokens + 1, step,
                     dtype=torch.int32, device=device)
-                # 与真实捕获 mask 对齐（attention_mask.py get_splitfuse_attn_mask
-                # 返回 2048x2048 int8 上三角），避免 get_max_workspace 因 mask
-                # dtype/内容差异返回偏小的 workspace。
+                # Estimate with the causal mask the op actually receives
+                # (2048x2048 int8 upper triangle) so get_max_workspace does not
+                # under-size due to a different mask dtype/content.
                 mtp_mask = (
                     torch.triu(
                         torch.ones(2048, 2048, device=device, dtype=torch.int8),

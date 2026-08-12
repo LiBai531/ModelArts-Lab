@@ -1,13 +1,10 @@
-"""MXFP4 KV cache: custom spec that drives KV-cache allocation, no kv_cache_dtype hack.
+"""MXFP4 KV cache spec that drives KV-cache allocation directly.
 
 Enabled via additional-config ``enable_mxfp4_kv: true``. The KV cache page is
 allocated from the spec's ``real_page_size_bytes`` = packed float4 data
 (head//2) + per-32-group e8m0 scale (head//32), kept as separate regions of
-one page and managed by the same block table. This mirrors the GLM-5.2 SFA
-``AscendMLAAttentionSpec`` approach (spec drives allocation directly), so
-``kv_cache_dtype`` stays at the vLLM default and none of the previous
-monkey-patches (CacheConfig swap, KVQuantMode injection, get_kv_quant_mode,
-real_page_size_bytes) are needed.
+one page and managed by the same block table. The spec drives allocation
+directly, so ``kv_cache_dtype`` stays at the vLLM default.
 """
 
 import math
