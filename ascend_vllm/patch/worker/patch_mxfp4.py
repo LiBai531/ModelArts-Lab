@@ -1,4 +1,5 @@
 import math
+import re
 
 import torch
 import torch_npu
@@ -157,11 +158,14 @@ def _quantize_kv_to_mxfp4(
     actual_key = key[:num_actual_tokens]
     actual_value = value[:num_actual_tokens]
 
-    # K/V write path is eager (outside the ACL graph capture region: it uses
-    # per-step slot_mapping), so a device check is safe here. Use the
-    # per-(device,dtype) cached Hadamard block (built eagerly in pwal / first
-    # forward) so multi-device (TP) is correct and no tensor is created during
-    # graph capture.
+    # K/V write path runs inside the ACL graph capture region (the whole model
+    # forward is wrapped by ACLGraphWrapper). This is safe because key/value and
+    # slot_mapping are stable-address graph inputs whose contents are refreshed
+    # each replay step, and padding slots use slot_mapping=-1 (scatter no-op) --
+    # the same mechanism as the upstream reshape_and_cache in graph mode. Still,
+    # avoid creating any tensor here: the Hadamard block below is a cached
+    # per-(device,dtype) buffer built eagerly in pwal / first forward, so graph
+    # capture stays free of host-side allocation.
     Q = AscendAttentionBackendImpl._hadamard_32
     if Q is None or Q.dtype != actual_key.dtype or Q.device != actual_key.device:
         Q = _get_orthogonal_block(
@@ -196,13 +200,33 @@ def _scatter_mxfp4_kv_and_scales(
     k_scales, v_scales,
     kv_cache, attn_metadata
 ):
-    if not isinstance(kv_cache, list | tuple) or len(kv_cache) < 2:
-        return
-    
-    if kv_cache[0] is not self.key_cache:
-        self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
-    if len(kv_cache) >= 4 and kv_cache[2] is not self.mxfp4_k_scale_cache:
-        self.mxfp4_k_scale_cache, self.mxfp4_v_scale_cache = kv_cache[2], kv_cache[3]
+    if isinstance(kv_cache, torch.Tensor):
+        # Packed (2, n_blocks, block_size, n_kv_heads, head_dim) fallback layout:
+        # kv_cache[0] is K and kv_cache[1] is V. This layout carries no scale
+        # region, so the scale caches come from the lazy-init fallback in
+        # _forward_mxfp4.
+        if kv_cache.dim() < 1 or kv_cache.shape[0] != 2:
+            raise ValueError(
+                "mxfp4 kv cache tensor must be shaped (2, n_blocks, ...), "
+                f"got {tuple(kv_cache.shape)}"
+            )
+        if kv_cache[0] is not self.key_cache:
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+    elif isinstance(kv_cache, (list, tuple)):
+        if len(kv_cache) < 2:
+            raise ValueError(
+                f"mxfp4 kv cache tuple must carry at least (K, V), "
+                f"got {len(kv_cache)} element(s)"
+            )
+        if kv_cache[0] is not self.key_cache:
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+        if len(kv_cache) >= 4 and kv_cache[2] is not self.mxfp4_k_scale_cache:
+            self.mxfp4_k_scale_cache, self.mxfp4_v_scale_cache = kv_cache[2], kv_cache[3]
+    else:
+        raise ValueError(
+            f"mxfp4 kv cache must be a tensor or a list/tuple of caches, "
+            f"got {type(kv_cache).__name__}"
+        )
 
     slots = attn_metadata.slot_mapping
     num_actual = attn_metadata.num_actual_tokens
@@ -802,6 +826,22 @@ def _mxfp4_update_graph_params(
             attn_keys_length = len(graph_params.attn_params[num_tokens])
             if attn_keys_length == 0:
                 return
+            # MTP target 图：forward_context.attn_metadata 混入了 draft KV-cache
+            # group 的 key（model_runner 的 _build_attention_metadata 把全部
+            # group 的层都填进来），而主图只捕获 target 自注意层。过滤出
+            # direct target 层（layers.<N>.self_attn.attn）以避免 zip 时与
+            # 捕获的 FIA op 错位（镜像上游 attention_v1 L657-665）。
+            if (
+                speculative_config is not None
+                and getattr(speculative_config, "method", None) == "mtp"
+            ):
+                direct_target_keys = [
+                    k
+                    for k in attn_keys
+                    if re.search(r"(?:^|\.)layers\.(\d+)\.self_attn\.attn$", k)
+                ]
+                if direct_target_keys:
+                    attn_keys = direct_target_keys
             # No sorting: each captured param carries its own layer name and
             # replay looks the metadata up by name (see metadata_key below),
             # so iteration order is irrelevant. This mirrors upstream
@@ -978,13 +1018,23 @@ def _precompute_mxfp4_workspaces(self):
                 impl, num_tokens, num_tokens, pure_qlen, 0, None)
             if best is None or ws.numel() > best.numel():
                 best = ws
+            # MTP 捕获 size 恒为 step 的整数倍（uniform_decode 的
+            # max_query_len = 1 + num_speculative_tokens），所以只在整除时
+            # 覆盖 MTP（sparse_mode=3）pattern 即可。
             if step > 1 and num_tokens % step == 0:
                 mtp_batch = num_tokens // step
                 mtp_qlen = torch.arange(
                     step, num_tokens + 1, step,
                     dtype=torch.int32, device=device)
-                mtp_mask = torch.zeros(
-                    2048, 2048, dtype=torch.bool, device=device)
+                # 与真实捕获 mask 对齐（attention_mask.py get_splitfuse_attn_mask
+                # 返回 2048x2048 int8 上三角），避免 get_max_workspace 因 mask
+                # dtype/内容差异返回偏小的 workspace。
+                mtp_mask = (
+                    torch.triu(
+                        torch.ones(2048, 2048, device=device, dtype=torch.int8),
+                        diagonal=1,
+                    )
+                )
                 mtp_ws = _ws_for_pattern(
                     impl, num_tokens, mtp_batch, mtp_qlen, 3, mtp_mask)
                 if mtp_ws.numel() > best.numel():
