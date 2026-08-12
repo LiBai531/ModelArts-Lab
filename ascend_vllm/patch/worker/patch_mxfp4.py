@@ -124,6 +124,18 @@ def _mxfp4_pwal(self, act_dtype: torch.dtype):
 AscendAttentionBackendImpl.process_weights_after_loading = _mxfp4_pwal
 
 
+def _k_scale_fp8(self):
+    return self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
+
+
+def _v_scale_fp8(self):
+    return self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
+
+
+AscendAttentionBackendImpl._k_scale_fp8 = property(_k_scale_fp8)
+AscendAttentionBackendImpl._v_scale_fp8 = property(_v_scale_fp8)
+
+
 def _rotate(self, x: torch.Tensor) -> torch.Tensor:
     Q = AscendAttentionBackendImpl._hadamard_32
     if Q is None or Q.dtype != x.dtype or Q.device != x.device:
@@ -261,7 +273,7 @@ def _forward_mxfp4(
         and self.key_cache.dim() == 4
     ):
         num_blocks, block_size = self.key_cache.shape[0], self.key_cache.shape[1]
-        scale_dim = self.key_cache.shape[-1] // 16
+        scale_dim = self.key_cache.shape[-1] // (MXFP4_SCALE_GROUP_SIZE // 2)
         self.mxfp4_k_scale_cache = torch.zeros(
             num_blocks, block_size, self.num_kv_heads, scale_dim,
             dtype=torch.uint8, device=self.key_cache.device,
@@ -360,8 +372,8 @@ def full_graph_mxfp4_decode(
         _query_rot = torch.zeros_like(query[:num_tokens])
         self.mxfp4_query_rot_buffers[num_tokens] = _query_rot
 
-    k_scale = self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
-    v_scale = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
+    k_scale = self._k_scale_fp8
+    v_scale = self._v_scale_fp8
 
     if workspace is None:
         workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
@@ -469,8 +481,8 @@ def _forward_mxfp4_decode(self, query, attn_metadata, output) -> torch.Tensor:
         block_tables = attn_metadata.block_tables[:num_decodes]
         seq_lens_kv = attn_metadata.seq_lens_list[:num_decodes]
 
-        k_scale = self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
-        v_scale = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
+        k_scale = self._k_scale_fp8
+        v_scale = self._v_scale_fp8
 
         query_rot = self._rotate(query[:num_valid_tokens])
         use_causal_mask = num_valid_tokens > num_decodes
@@ -502,8 +514,8 @@ def _forward_mxfp4_decode(self, query, attn_metadata, output) -> torch.Tensor:
         block_tables = attn_metadata.block_tables[:batch_size]
         seq_lens_kv = attn_metadata.seq_lens_list[:batch_size]
 
-        k_scale = self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
-        v_scale = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
+        k_scale = self._k_scale_fp8
+        v_scale = self._v_scale_fp8
 
         query_rot = self._rotate(query[:batch_size])
 
@@ -556,8 +568,8 @@ def _forward_mxfp4_chunked_prefill(
             seq_lens_decode = attn_metadata.seq_lens_list[:num_decodes]
             batch_size_decode = num_decodes
 
-            k_scale = self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
-            v_scale = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
+            k_scale = self._k_scale_fp8
+            v_scale = self._v_scale_fp8
 
             actual_seq_qlen_decode = actual_seq_qlen[:batch_size_decode]
             num_valid_decode_tokens = int(actual_seq_qlen_decode[-1])
@@ -629,8 +641,8 @@ def _forward_mxfp4_chunked_prefill(
             prefill_block_tables = attn_metadata.block_tables[num_decodes:]
             prefill_seq_lens_kv = attn_metadata.seq_lens_list[num_decodes:]
 
-            k_scale_pf = self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
-            v_scale_pf = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
+            k_scale_pf = self._k_scale_fp8
+            v_scale_pf = self._v_scale_fp8
             prefill_actual_seq_qlen = torch.tensor(
                 prefill_seq_qlen, dtype=torch.int32
             )
@@ -706,8 +718,8 @@ def _forward_mxfp4_fused_infer_attention(
         num_block, block_size, _, _ = self.key_cache.shape
         key_bnsd = self.key_cache.view(num_block, block_size, -1)
         value_bnsd = self.value_cache.view(num_block, block_size, -1)
-        k_scale = self.mxfp4_k_scale_cache.view(torch.float8_e8m0fnu)
-        v_scale = self.mxfp4_v_scale_cache.view(torch.float8_e8m0fnu)
+        k_scale = self._k_scale_fp8
+        v_scale = self._v_scale_fp8
         # block_tables may be padded; slice to the real request count.
         batch_size = attn_metadata.seq_lens.shape[0]
         block_table = attn_metadata.block_tables[:batch_size, :]
@@ -936,10 +948,6 @@ def _precompute_mxfp4_workspaces(self):
         max_blocks_per_seq = max_seq_len // block_size
         key_3d = impl.key_cache.view(num_block, block_size, -1)
         value_3d = impl.value_cache.view(num_block, block_size, -1)
-        ks_4d = impl.mxfp4_k_scale_cache.view(
-            num_block, block_size, impl.num_kv_heads, -1)
-        vs_4d = impl.mxfp4_v_scale_cache.view(
-            num_block, block_size, impl.num_kv_heads, -1)
         bt = torch.zeros(
             batch_size, max_blocks_per_seq, dtype=torch.int32, device=device)
         kv_lens = torch.full(
@@ -949,8 +957,8 @@ def _precompute_mxfp4_workspaces(self):
             dtype=dtype, device=device)
         return torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
             query=q, key=key_3d, value=value_3d,
-            dequant_scale_key=ks_4d.view(torch.float8_e8m0fnu),
-            dequant_scale_value=vs_4d.view(torch.float8_e8m0fnu),
+            dequant_scale_key=impl._k_scale_fp8,
+            dequant_scale_value=impl._v_scale_fp8,
             block_table=bt, atten_mask=mask,
             input_layout="TND", block_size=block_size,
             actual_seq_qlen=q_lens, actual_seq_kvlen=kv_lens,
@@ -1059,14 +1067,17 @@ def _mxfp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors)
                 c4_total = k_data_numel + k_scale_numel + v_data_numel + v_scale_numel
                 raw_u8 = raw.view(torch.uint8)
                 base = raw_u8.numel() - c4_total
+                # k_data + v_data are aliased with ssm (contiguous in ssm
+                # region). k_scale + v_scale follow after ssm region.
                 k_cache = raw_u8[base:base + k_data_numel].view(
                     actual_num_blocks, actual_block_size, nk, hs_k)
-                k_scale_cache = raw_u8[base + k_data_numel:base + k_data_numel + k_scale_numel].view(
-                    actual_num_blocks, actual_block_size, nk, sk)
-                v_base = base + k_data_numel + k_scale_numel
-                v_cache = raw_u8[v_base:v_base + v_data_numel].view(
+                v_data_base = base + k_data_numel
+                v_cache = raw_u8[v_data_base:v_data_base + v_data_numel].view(
                     actual_num_blocks, actual_block_size, nk, hs_v)
-                v_scale_cache = raw_u8[v_base + v_data_numel:v_base + v_data_numel + v_scale_numel].view(
+                scale_base = base + k_data_numel + v_data_numel
+                k_scale_cache = raw_u8[scale_base:scale_base + k_scale_numel].view(
+                    actual_num_blocks, actual_block_size, nk, sk)
+                v_scale_cache = raw_u8[scale_base + k_scale_numel:scale_base + k_scale_numel + v_scale_numel].view(
                     actual_num_blocks, actual_block_size, nk, sv)
             else:
                 continue
@@ -1083,7 +1094,6 @@ _orig_get_kv_cache_spec = NPUModelRunner.get_kv_cache_spec
 def _mxfp4_get_kv_cache_spec(self) -> dict:
     kv_cache_spec = _orig_get_kv_cache_spec(self)
     enabled = _is_mxfp4_kv_enabled()
-    logger.info("[mxfp4_kv] _is_mxfp4_kv_enabled() = %s in get_kv_cache_spec", enabled)
     if not enabled:
         return kv_cache_spec
     c4_real_page_size = None
@@ -1122,7 +1132,14 @@ def _mxfp4_get_kv_cache_spec(self) -> dict:
                 for shape, dtype in zip(s.shapes, s.dtypes))
             for _, s in mamba_specs
         )
-        new_page_size = max_mamba_real + c4_real_page_size
+        # C4 k_data aliases with ssm (same page region). Subtract ssm_page
+        # from the total since it's no longer a separate region.
+        max_ssm_page = max(
+            max(math.prod(shape) * get_dtype_size(dtype)
+                for shape, dtype in zip(s.shapes, s.dtypes))
+            for _, s in mamba_specs
+        )
+        new_page_size = max_mamba_real - max_ssm_page + c4_real_page_size
         for layer_name, spec in kv_cache_spec.items():
             if isinstance(spec, (MambaSpec, AscendFullAttentionC4Spec)):
                 continue
