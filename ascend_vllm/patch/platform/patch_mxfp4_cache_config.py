@@ -10,12 +10,17 @@ monkey-patches (CacheConfig swap, KVQuantMode injection, get_kv_quant_mode,
 real_page_size_bytes) are needed.
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
-
+from vllm.logger import init_logger
+from vllm.model_executor.models import ModelRegistry
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1 import kv_cache_interface as kv_iface
+
+logger = init_logger(__name__)
 
 
 def mxfp4_kv_cache_data_dim(head_size: int) -> int:
@@ -77,3 +82,84 @@ class AscendFullAttentionC4Spec(kv_iface.FullAttentionSpec):
         object.__setattr__(merged, "scale_dim_v", specs[0].scale_dim_v)
         object.__setattr__(merged, "scale_dtype", specs[0].scale_dtype)
         return merged
+
+
+import vllm.model_executor.models.config as _model_config_mod
+
+_orig_verify = _model_config_mod.HybridAttentionMambaModelConfig.verify_and_update_config
+
+
+@classmethod
+def _c4_verify_and_update_config(cls, vllm_config):
+    _orig_verify.__func__(cls, vllm_config)
+
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    if not additional_config.get("enable_mxfp4_kv", False):
+        return
+
+    model_config = vllm_config.model_config
+    if model_config.use_mla:
+        return
+
+    cache_config = vllm_config.cache_config
+    parallel_config = vllm_config.parallel_config
+
+    kernel_block_size = 128
+    model_cls, _ = ModelRegistry.resolve_model_cls(
+        model_config.architecture,
+        model_config=model_config,
+    )
+    mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
+    mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    mamba_sizes = [
+        math.prod(s) * get_dtype_size(d)
+        for s, d in zip(mamba_shapes, mamba_dtypes)
+    ]
+    ssm_block_page_size = max(mamba_sizes)
+    conv_block_page_size = min(mamba_sizes) if len(mamba_sizes) > 1 else 0
+
+    # C4 k_data + v_data per token (uint8): both alias with ssm.
+    # (k_data + v_data)_page must equal ssm_page for aliasing.
+    num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+    head_size = model_config.get_head_size()
+    kv_data_per_token = mxfp4_kv_cache_data_dim(head_size) * num_kv_heads * 2
+
+    attn_block_size = kernel_block_size * cdiv(
+        ssm_block_page_size, kernel_block_size * kv_data_per_token
+    )
+    assert kv_data_per_token * attn_block_size == ssm_block_page_size, (
+        f"Cannot align C4 kv_data page and ssm page: "
+        f"kv_data_per_token={kv_data_per_token}, "
+        f"block_size={attn_block_size}, "
+        f"ssm_page={ssm_block_page_size}"
+    )
+
+    cache_config.block_size = attn_block_size
+
+    # Recompute mamba_page_size_padded using C4 page dims.
+    # C4 token page = (data+scale) * 2 (k+v) * num_kv_heads, all uint8.
+    # k_data + v_data are aliased with ssm; only k_scale + v_scale are
+    # extra (not used by mamba).
+    scale_dim = mxfp4_kv_cache_scale_dim(head_size)
+    c4_token_page_size = (
+        (mxfp4_kv_cache_data_dim(head_size) + scale_dim) * 2 * num_kv_heads
+    )
+    attn_page_size = cache_config.block_size * c4_token_page_size
+    cache_config.mamba_page_size_padded = attn_page_size + conv_block_page_size
+
+    if cache_config.enable_prefix_caching and cache_config.mamba_cache_mode == "align":
+        cache_config.mamba_block_size = cache_config.block_size
+
+    logger.info(
+        "[mxfp4_kv] C4 aliasing: block_size=%d, kv_data_per_token=%d, "
+        "ssm_page=%d, mamba_page_size_padded=%d",
+        attn_block_size,
+        kv_data_per_token,
+        ssm_block_page_size,
+        cache_config.mamba_page_size_padded,
+    )
+
+
+_model_config_mod.HybridAttentionMambaModelConfig.verify_and_update_config = (
+    _c4_verify_and_update_config
+)
